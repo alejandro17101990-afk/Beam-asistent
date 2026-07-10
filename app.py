@@ -7,11 +7,14 @@ y edición iterativa de informes radiológicos estructurados
 Modelo de generación: DeepSeek (deepseek-chat / deepseek-reasoner), vía API
 compatible con OpenAI (base_url distinto).
 
-Transcripción por voz (opcional): requiere una API key de OpenAI aparte,
-ya que DeepSeek no ofrece un endpoint de transcripción tipo Whisper.
+Transcripción por voz: reconocimiento de voz GRATUITO de Google (librería
+`SpeechRecognition`), sin necesidad de ninguna API key.
+
+Estilo personalizado: puedes subir un informe propio (.docx o .txt) como
+plantilla; BEAM lo usará como referencia de tu estilo de redacción.
 
 Requisitos:
-    pip install streamlit openai audio-recorder-streamlit python-docx
+    pip install streamlit openai audio-recorder-streamlit python-docx SpeechRecognition
 
 Ejecutar:
     streamlit run app.py
@@ -29,6 +32,12 @@ try:
     AUDIO_DISPONIBLE = True
 except ImportError:
     AUDIO_DISPONIBLE = False
+
+try:
+    import speech_recognition as sr
+    SR_DISPONIBLE = True
+except ImportError:
+    SR_DISPONIBLE = False
 
 try:
     from docx import Document
@@ -153,8 +162,8 @@ def _init_estado():
             }
         ]
     st.session_state.setdefault("deepseek_api_key", os.environ.get("DEEPSEEK_API_KEY", ""))
-    st.session_state.setdefault("openai_api_key", os.environ.get("OPENAI_API_KEY", ""))
     st.session_state.setdefault("transcripcion_pendiente", "")
+    st.session_state.setdefault("plantilla_texto", "")
     st.session_state.setdefault("tema_nombre", "Dorado (original)")
     st.session_state.setdefault("fuente_nombre", "Inter (sans, default)")
     st.session_state.setdefault(
@@ -171,10 +180,6 @@ def aplicar_terminologia(texto: str) -> str:
 
 def obtener_cliente_deepseek() -> OpenAI:
     return OpenAI(api_key=st.session_state.deepseek_api_key, base_url=DEEPSEEK_BASE_URL)
-
-
-def obtener_cliente_openai() -> OpenAI:
-    return OpenAI(api_key=st.session_state.openai_api_key)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -265,19 +270,56 @@ def inyectar_estilo(tema: dict, fuente_css: str):
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# TRANSCRIPCIÓN (WHISPER, vía OpenAI — opcional)
+# TRANSCRIPCIÓN (RECONOCIMIENTO DE VOZ GRATUITO DE GOOGLE)
 # ──────────────────────────────────────────────────────────────────────────
 
 def transcribir_audio(audio_bytes: bytes) -> str:
+    """Transcribe audio a texto usando el reconocimiento de voz gratuito de
+    Google Web Speech API (vía la librería `SpeechRecognition`). No requiere
+    ninguna API key."""
+    reconocedor = sr.Recognizer()
     buffer_audio = io.BytesIO(audio_bytes)
-    buffer_audio.name = "dictado.wav"
-    cliente = obtener_cliente_openai()
-    respuesta = cliente.audio.transcriptions.create(
-        model="whisper-1",
-        file=buffer_audio,
-        language="es",
-    )
-    return respuesta.text.strip()
+    with sr.AudioFile(buffer_audio) as fuente:
+        datos_audio = reconocedor.record(fuente)
+    try:
+        return reconocedor.recognize_google(datos_audio, language="es-MX").strip()
+    except sr.UnknownValueError:
+        return ""
+    except sr.RequestError as e:
+        raise RuntimeError(f"No se pudo contactar al servicio de reconocimiento de Google: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# PLANTILLA DE ESTILO DEL RADIÓLOGO
+# ──────────────────────────────────────────────────────────────────────────
+
+def extraer_texto_plantilla(archivo) -> str:
+    """Extrae el texto de un informe subido como referencia de estilo (.docx o .txt)."""
+    nombre = archivo.name.lower()
+    if nombre.endswith(".docx"):
+        if not DOCX_DISPONIBLE:
+            raise RuntimeError("Instala `python-docx` para leer archivos .docx.")
+        documento = Document(archivo)
+        parrafos = [p.text for p in documento.paragraphs if p.text.strip()]
+        return "\n".join(parrafos)
+    return archivo.read().decode("utf-8", errors="ignore")
+
+
+def construir_system_prompt() -> str:
+    prompt = SYSTEM_PROMPT
+    plantilla = st.session_state.get("plantilla_texto", "")
+    if plantilla:
+        fragmento = plantilla[:6000]
+        prompt += (
+            "\n\nEl radiólogo ha compartido uno de sus informes previos como referencia de su "
+            "estilo personal de redacción (vocabulario habitual, orden interno de las secciones, "
+            "nivel de detalle, giros de frase). Adapta la redacción de TÉCNICA, HALLAZGOS y "
+            "CONCLUSIÓN a ese estilo siempre que sea coherente con las reglas terminológicas "
+            "anteriores, sin copiar datos clínicos de este ejemplo (corresponde a otro paciente, "
+            "es solo una referencia de forma):\n\n"
+            f"--- EJEMPLO DE ESTILO DEL RADIÓLOGO ---\n{fragmento}\n--- FIN DEL EJEMPLO ---"
+        )
+    return prompt
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -287,7 +329,7 @@ def transcribir_audio(audio_bytes: bytes) -> str:
 def generar_respuesta(modelo: str):
     cliente = obtener_cliente_deepseek()
 
-    historial_api = [{"role": "system", "content": SYSTEM_PROMPT}] + [
+    historial_api = [{"role": "system", "content": construir_system_prompt()}] + [
         {"role": m["role"], "content": m["content"]} for m in st.session_state.mensajes
     ]
 
@@ -306,29 +348,6 @@ def generar_respuesta(modelo: str):
                 yield texto
 
     return generador
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# EXPORTAR A WORD
-# ──────────────────────────────────────────────────────────────────────────
-
-def exportar_docx(texto: str) -> bytes:
-    documento = Document()
-    for linea in texto.split("\n"):
-        if linea.strip().upper() in ("TÉCNICA", "HALLAZGOS", "CONCLUSIÓN"):
-            documento.add_heading(linea.strip(), level=2)
-        elif linea.strip():
-            documento.add_paragraph(linea.strip())
-    buffer = io.BytesIO()
-    documento.save(buffer)
-    return buffer.getvalue()
-
-
-def ultimo_mensaje_asistente() -> str:
-    for m in reversed(st.session_state.mensajes):
-        if m["role"] == "assistant":
-            return m["content"]
-    return ""
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -367,7 +386,6 @@ def main():
                 "Paleta de color", list(TEMAS.keys()),
                 index=list(TEMAS.keys()).index(st.session_state.tema_nombre),
             )
-            # Si cambia la paleta base, refresca el acento sugerido salvo que el usuario ya lo haya personalizado
             base_accent = TEMAS[st.session_state.tema_nombre]["accent"]
             st.session_state.color_acento_custom = st.color_picker(
                 "Color de acento", value=st.session_state.color_acento_custom or base_accent,
@@ -384,13 +402,16 @@ def main():
 
         st.divider()
 
-        with st.expander("🎙️ Dictado por voz (opcional, requiere OpenAI)"):
-            st.caption("DeepSeek no ofrece transcripción de audio; esta función usa Whisper de OpenAI.")
-            st.session_state.openai_api_key = st.text_input(
-                "OpenAI API key (solo para voz)", value=st.session_state.openai_api_key,
-                type="password", placeholder="sk-...",
+        with st.expander("🎙️ Dictado por voz (gratuito, Google)"):
+            st.caption(
+                "Transcripción con el reconocimiento de voz gratuito de Google. "
+                "No requiere ninguna API key."
             )
-            if AUDIO_DISPONIBLE and st.session_state.openai_api_key:
+            if not SR_DISPONIBLE:
+                st.caption("Instala `SpeechRecognition` (`pip install SpeechRecognition`) para habilitar esta función.")
+            elif not AUDIO_DISPONIBLE:
+                st.caption("Instala `audio-recorder-streamlit` para habilitar esta función.")
+            else:
                 audio_bytes = audio_recorder(
                     text="",
                     recording_color=st.session_state.color_acento_custom,
@@ -402,7 +423,11 @@ def main():
                 if audio_bytes:
                     with st.spinner("Transcribiendo…"):
                         try:
-                            st.session_state.transcripcion_pendiente = transcribir_audio(audio_bytes)
+                            texto_transcrito = transcribir_audio(audio_bytes)
+                            if texto_transcrito:
+                                st.session_state.transcripcion_pendiente = texto_transcrito
+                            else:
+                                st.warning("No se detectó voz reconocible en el audio.")
                         except Exception as e:
                             st.error(f"Error al transcribir: {e}")
 
@@ -417,26 +442,39 @@ def main():
                         st.session_state.mensajes.append({"role": "user", "content": texto})
                         st.session_state["_generar_ahora"] = True
                         st.rerun()
-            elif not AUDIO_DISPONIBLE:
-                st.caption("Instala `audio-recorder-streamlit` para habilitar esta función.")
 
         st.divider()
 
-        ultimo = ultimo_mensaje_asistente()
-        if ultimo:
-            st.download_button(
-                "⬇️ Descargar último informe (.txt)",
-                data=ultimo,
-                file_name=f"informe_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.txt",
-                use_container_width=True,
+        with st.expander("📄 Tu plantilla de estilo", expanded=not st.session_state.plantilla_texto):
+            st.caption(
+                "Sube un informe tuyo ya redactado (.docx o .txt) para que BEAM aprenda tu "
+                "vocabulario, orden interno y estilo de redacción, y lo use en todos los "
+                "informes que genere."
             )
-            if DOCX_DISPONIBLE:
-                st.download_button(
-                    "⬇️ Descargar último informe (.docx)",
-                    data=exportar_docx(ultimo),
-                    file_name=f"informe_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.docx",
-                    use_container_width=True,
+            plantilla_archivo = st.file_uploader(
+                "Informe de referencia", type=["docx", "txt"], key="plantilla_uploader",
+            )
+            if plantilla_archivo is not None:
+                try:
+                    texto_plantilla = extraer_texto_plantilla(plantilla_archivo)
+                    if texto_plantilla.strip():
+                        st.session_state.plantilla_texto = texto_plantilla
+                        st.success(f"Plantilla cargada ({len(texto_plantilla)} caracteres).")
+                    else:
+                        st.warning("No se pudo extraer texto de ese archivo.")
+                except Exception as e:
+                    st.error(f"Error al leer la plantilla: {e}")
+
+            if st.session_state.plantilla_texto:
+                st.caption("✅ BEAM está usando tu plantilla como referencia de estilo.")
+                st.text_area(
+                    "Vista previa (solo lectura)",
+                    value=st.session_state.plantilla_texto[:2000],
+                    height=120, disabled=True,
                 )
+                if st.button("Quitar plantilla", use_container_width=True):
+                    st.session_state.plantilla_texto = ""
+                    st.rerun()
 
     for mensaje in st.session_state.mensajes:
         with st.chat_message(mensaje["role"]):
