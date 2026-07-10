@@ -4,11 +4,14 @@ Interfaz de chat (estilo ChatGPT / Claude / Gemini) para dictado, redacción
 y edición iterativa de informes radiológicos estructurados
 (TÉCNICA / HALLAZGOS / CONCLUSIÓN).
 
+Modelo de generación: DeepSeek (deepseek-chat / deepseek-reasoner), vía API
+compatible con OpenAI (base_url distinto).
+
+Transcripción por voz (opcional): requiere una API key de OpenAI aparte,
+ya que DeepSeek no ofrece un endpoint de transcripción tipo Whisper.
+
 Requisitos:
     pip install streamlit openai audio-recorder-streamlit python-docx
-
-Variables de entorno / secrets necesarios:
-    OPENAI_API_KEY   -> para Whisper (transcripción) y GPT (generación / chat)
 
 Ejecutar:
     streamlit run app.py
@@ -44,9 +47,12 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-MODELOS_DISPONIBLES = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"]
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+MODELOS_DEEPSEEK = {
+    "deepseek-chat": "DeepSeek Chat (V3)",
+    "deepseek-reasoner": "DeepSeek Reasoner (R1)",
+}
 
-# Reglas terminológicas obligatorias (glosario de sustituciones)
 TERMINOLOGIA_CORRECTA = {
     "osteoartritis": "osteoartrosis",
     "ruptura": "desgarro",
@@ -86,6 +92,50 @@ imagen), genera directamente el informe estructurado sin pedir confirmación.
 """
 
 # ──────────────────────────────────────────────────────────────────────────
+# TEMAS DE COLOR Y TIPOGRAFÍAS
+# ──────────────────────────────────────────────────────────────────────────
+
+TEMAS = {
+    "Dorado (original)": {
+        "accent": "#E8B84B", "bg": "#111112", "surface": "#18181B",
+        "border": "#2A2A2E", "text": "#E8E8E8", "muted": "#9A9A9E",
+    },
+    "Esmeralda": {
+        "accent": "#34D399", "bg": "#0F1512", "surface": "#161C19",
+        "border": "#233029", "text": "#E5EFE9", "muted": "#8FA79B",
+    },
+    "Zafiro": {
+        "accent": "#5B9DF9", "bg": "#0E1116", "surface": "#161A21",
+        "border": "#232838", "text": "#E6EAF2", "muted": "#8C97AD",
+    },
+    "Violeta": {
+        "accent": "#B893F0", "bg": "#131018", "surface": "#1B1622",
+        "border": "#2C2436", "text": "#ECE6F2", "muted": "#A497AF",
+    },
+    "Grafito claro": {
+        "accent": "#C6922A", "bg": "#F7F7F5", "surface": "#FFFFFF",
+        "border": "#E3E3E0", "text": "#1A1A1A", "muted": "#6B6B68",
+    },
+}
+
+FUENTES = {
+    "Inter (sans, default)": "'Inter', sans-serif",
+    "Space Grotesk (sans)": "'Space Grotesk', sans-serif",
+    "Sistema (estilo Söhne/SF)": "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+    "JetBrains Mono (mono)": "'JetBrains Mono', monospace",
+    "IBM Plex Mono (mono)": "'IBM Plex Mono', monospace",
+}
+
+GOOGLE_FONTS_IMPORT = (
+    "@import url('https://fonts.googleapis.com/css2?"
+    "family=Inter:wght@400;500;600;700&"
+    "family=Space+Grotesk:wght@400;500;600;700&"
+    "family=JetBrains+Mono:wght@400;500;600&"
+    "family=IBM+Plex+Mono:wght@400;500;600&"
+    "display=swap');"
+)
+
+# ──────────────────────────────────────────────────────────────────────────
 # ESTADO DE SESIÓN
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -102,78 +152,112 @@ def _init_estado():
                 ),
             }
         ]
-    if "api_key" not in st.session_state:
-        st.session_state.api_key = os.environ.get("OPENAI_API_KEY", "")
-    if "transcripcion_pendiente" not in st.session_state:
-        st.session_state.transcripcion_pendiente = ""
+    st.session_state.setdefault("deepseek_api_key", os.environ.get("DEEPSEEK_API_KEY", ""))
+    st.session_state.setdefault("openai_api_key", os.environ.get("OPENAI_API_KEY", ""))
+    st.session_state.setdefault("transcripcion_pendiente", "")
+    st.session_state.setdefault("tema_nombre", "Dorado (original)")
+    st.session_state.setdefault("fuente_nombre", "Inter (sans, default)")
+    st.session_state.setdefault(
+        "color_acento_custom", TEMAS[st.session_state.get("tema_nombre", "Dorado (original)")]["accent"]
+    )
 
 
 def aplicar_terminologia(texto: str) -> str:
-    """Corrige términos no preferidos según el glosario institucional."""
     for incorrecto, correcto in TERMINOLOGIA_CORRECTA.items():
         texto = texto.replace(incorrecto, correcto)
         texto = texto.replace(incorrecto.capitalize(), correcto.capitalize())
     return texto
 
 
-def obtener_cliente() -> OpenAI:
-    return OpenAI(api_key=st.session_state.api_key)
+def obtener_cliente_deepseek() -> OpenAI:
+    return OpenAI(api_key=st.session_state.deepseek_api_key, base_url=DEEPSEEK_BASE_URL)
+
+
+def obtener_cliente_openai() -> OpenAI:
+    return OpenAI(api_key=st.session_state.openai_api_key)
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# ESTILO — TEMA OSCURO PREMIUM
+# ESTILO — TEMA DINÁMICO (COLOR + TIPOGRAFÍA)
 # ──────────────────────────────────────────────────────────────────────────
 
-def inyectar_estilo():
+def inyectar_estilo(tema: dict, fuente_css: str):
     st.markdown(
-        """
+        f"""
         <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+        {GOOGLE_FONTS_IMPORT}
 
-        .stApp { background-color: #111112; color: #E8E8E8; }
+        :root {{
+            --accent: {tema['accent']};
+            --bg: {tema['bg']};
+            --surface: {tema['surface']};
+            --border: {tema['border']};
+            --text: {tema['text']};
+            --muted: {tema['muted']};
+        }}
 
-        section[data-testid="stSidebar"] {
-            background-color: #17171A;
-            border-right: 1px solid #2A2A2E;
-        }
+        .stApp {{
+            background-color: var(--bg);
+            color: var(--text);
+            font-family: {fuente_css};
+        }}
 
-        .titulo-beam {
-            font-family: 'Inter', sans-serif;
+        section[data-testid="stSidebar"] {{
+            background-color: var(--surface);
+            border-right: 1px solid var(--border);
+        }}
+
+        h1, h2, h3, .titulo-beam {{
+            font-family: {fuente_css};
+        }}
+
+        .titulo-beam {{
             font-weight: 700;
             font-size: 1.7rem;
-            color: #E8B84B;
+            color: var(--accent);
             letter-spacing: 0.5px;
-        }
-        .subtitulo-beam {
-            color: #9A9A9E;
+        }}
+        .subtitulo-beam {{
+            color: var(--muted);
             font-size: 0.85rem;
             margin-bottom: 1.2rem;
-        }
+        }}
 
-        [data-testid="stChatMessage"] {
-            background-color: #18181B;
-            border: 1px solid #2A2A2E;
+        [data-testid="stChatMessage"] {{
+            background-color: var(--surface);
+            border: 1px solid var(--border);
             border-radius: 12px;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 0.92rem;
+            font-family: {fuente_css};
+            font-size: 0.94rem;
             line-height: 1.65;
-        }
+            color: var(--text);
+        }}
 
-        div.stButton > button, div.stDownloadButton > button {
-            background-color: #E8B84B;
-            color: #111112;
+        div.stButton > button, div.stDownloadButton > button {{
+            background-color: var(--accent);
+            color: var(--bg);
             border: none;
             border-radius: 8px;
             font-weight: 600;
-        }
-        div.stButton > button:hover, div.stDownloadButton > button:hover {
-            background-color: #F4C766;
-            color: #111112;
-        }
+            font-family: {fuente_css};
+        }}
+        div.stButton > button:hover, div.stDownloadButton > button:hover {{
+            filter: brightness(1.1);
+            color: var(--bg);
+        }}
 
-        [data-testid="stChatInput"] textarea {
-            font-family: 'JetBrains Mono', monospace;
-        }
+        [data-testid="stChatInput"] textarea {{
+            font-family: {fuente_css};
+        }}
+
+        .swatch-preview {{
+            display: inline-block;
+            width: 14px; height: 14px;
+            border-radius: 4px;
+            margin-right: 6px;
+            vertical-align: middle;
+            border: 1px solid var(--border);
+        }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -181,13 +265,13 @@ def inyectar_estilo():
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# TRANSCRIPCIÓN (WHISPER)
+# TRANSCRIPCIÓN (WHISPER, vía OpenAI — opcional)
 # ──────────────────────────────────────────────────────────────────────────
 
 def transcribir_audio(audio_bytes: bytes) -> str:
     buffer_audio = io.BytesIO(audio_bytes)
     buffer_audio.name = "dictado.wav"
-    cliente = obtener_cliente()
+    cliente = obtener_cliente_openai()
     respuesta = cliente.audio.transcriptions.create(
         model="whisper-1",
         file=buffer_audio,
@@ -197,12 +281,11 @@ def transcribir_audio(audio_bytes: bytes) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# GENERACIÓN DE RESPUESTA (CHAT, CON STREAMING)
+# GENERACIÓN DE RESPUESTA (CHAT, CON STREAMING, DEEPSEEK)
 # ──────────────────────────────────────────────────────────────────────────
 
 def generar_respuesta(modelo: str):
-    """Llama al modelo con todo el historial y transmite la respuesta en vivo."""
-    cliente = obtener_cliente()
+    cliente = obtener_cliente_deepseek()
 
     historial_api = [{"role": "system", "content": SYSTEM_PROMPT}] + [
         {"role": m["role"], "content": m["content"]} for m in st.session_state.mensajes
@@ -217,9 +300,10 @@ def generar_respuesta(modelo: str):
 
     def generador():
         for fragmento in stream:
-            delta = fragmento.choices[0].delta.content or ""
-            if delta:
-                yield delta
+            delta = fragmento.choices[0].delta
+            texto = getattr(delta, "content", None) or ""
+            if texto:
+                yield texto
 
     return generador
 
@@ -253,7 +337,11 @@ def ultimo_mensaje_asistente() -> str:
 
 def main():
     _init_estado()
-    inyectar_estilo()
+
+    tema_seleccionado = TEMAS[st.session_state.tema_nombre].copy()
+    tema_seleccionado["accent"] = st.session_state.color_acento_custom
+    fuente_css = FUENTES[st.session_state.fuente_nombre]
+    inyectar_estilo(tema_seleccionado, fuente_css)
 
     with st.sidebar:
         st.markdown('<div class="titulo-beam">BEAM</div>', unsafe_allow_html=True)
@@ -262,12 +350,32 @@ def main():
             unsafe_allow_html=True,
         )
 
-        if not st.session_state.api_key:
-            st.session_state.api_key = st.text_input(
-                "OpenAI API key", type="password", placeholder="sk-..."
+        with st.expander("🔑 Conexión (DeepSeek)", expanded=not st.session_state.deepseek_api_key):
+            st.session_state.deepseek_api_key = st.text_input(
+                "DeepSeek API key", value=st.session_state.deepseek_api_key,
+                type="password", placeholder="sk-...",
+            )
+            modelo = st.selectbox(
+                "Modelo",
+                list(MODELOS_DEEPSEEK.keys()),
+                format_func=lambda m: MODELOS_DEEPSEEK[m],
+                index=0,
             )
 
-        modelo = st.selectbox("Modelo", MODELOS_DISPONIBLES, index=0)
+        with st.expander("🎨 Apariencia"):
+            st.session_state.tema_nombre = st.selectbox(
+                "Paleta de color", list(TEMAS.keys()),
+                index=list(TEMAS.keys()).index(st.session_state.tema_nombre),
+            )
+            # Si cambia la paleta base, refresca el acento sugerido salvo que el usuario ya lo haya personalizado
+            base_accent = TEMAS[st.session_state.tema_nombre]["accent"]
+            st.session_state.color_acento_custom = st.color_picker(
+                "Color de acento", value=st.session_state.color_acento_custom or base_accent,
+            )
+            st.session_state.fuente_nombre = st.selectbox(
+                "Tipografía", list(FUENTES.keys()),
+                index=list(FUENTES.keys()).index(st.session_state.fuente_nombre),
+            )
 
         if st.button("＋ Nueva conversación", use_container_width=True):
             st.session_state.mensajes = []
@@ -276,37 +384,41 @@ def main():
 
         st.divider()
 
-        if AUDIO_DISPONIBLE:
-            st.caption("🎙️ Dictado por voz")
-            audio_bytes = audio_recorder(
-                text="",
-                recording_color="#E8B84B",
-                neutral_color="#2A2A2E",
-                icon_size="2x",
-                pause_threshold=2.0,
-                key="grabadora",
+        with st.expander("🎙️ Dictado por voz (opcional, requiere OpenAI)"):
+            st.caption("DeepSeek no ofrece transcripción de audio; esta función usa Whisper de OpenAI.")
+            st.session_state.openai_api_key = st.text_input(
+                "OpenAI API key (solo para voz)", value=st.session_state.openai_api_key,
+                type="password", placeholder="sk-...",
             )
-            if audio_bytes:
-                with st.spinner("Transcribiendo…"):
-                    try:
-                        st.session_state.transcripcion_pendiente = transcribir_audio(audio_bytes)
-                    except Exception as e:
-                        st.error(f"Error al transcribir: {e}")
-
-            if st.session_state.transcripcion_pendiente:
-                st.text_area(
-                    "Transcripción (editable, envíala desde el chat)",
-                    key="transcripcion_pendiente",
-                    height=140,
+            if AUDIO_DISPONIBLE and st.session_state.openai_api_key:
+                audio_bytes = audio_recorder(
+                    text="",
+                    recording_color=st.session_state.color_acento_custom,
+                    neutral_color="#2A2A2E",
+                    icon_size="2x",
+                    pause_threshold=2.0,
+                    key="grabadora",
                 )
-                if st.button("Enviar transcripción al chat", use_container_width=True):
-                    texto = st.session_state.transcripcion_pendiente
-                    st.session_state.transcripcion_pendiente = ""
-                    st.session_state.mensajes.append({"role": "user", "content": texto})
-                    st.session_state["_generar_ahora"] = True
-                    st.rerun()
-        else:
-            st.caption("Instala `audio-recorder-streamlit` para dictado por voz.")
+                if audio_bytes:
+                    with st.spinner("Transcribiendo…"):
+                        try:
+                            st.session_state.transcripcion_pendiente = transcribir_audio(audio_bytes)
+                        except Exception as e:
+                            st.error(f"Error al transcribir: {e}")
+
+                if st.session_state.transcripcion_pendiente:
+                    st.text_area(
+                        "Transcripción (editable, envíala desde el chat)",
+                        key="transcripcion_pendiente", height=140,
+                    )
+                    if st.button("Enviar transcripción al chat", use_container_width=True):
+                        texto = st.session_state.transcripcion_pendiente
+                        st.session_state.transcripcion_pendiente = ""
+                        st.session_state.mensajes.append({"role": "user", "content": texto})
+                        st.session_state["_generar_ahora"] = True
+                        st.rerun()
+            elif not AUDIO_DISPONIBLE:
+                st.caption("Instala `audio-recorder-streamlit` para habilitar esta función.")
 
         st.divider()
 
@@ -326,12 +438,10 @@ def main():
                     use_container_width=True,
                 )
 
-    # ── Historial del chat ──────────────────────────────────────────────
     for mensaje in st.session_state.mensajes:
         with st.chat_message(mensaje["role"]):
             st.markdown(mensaje["content"])
 
-    # ── Entrada de texto ────────────────────────────────────────────────
     prompt = st.chat_input("Dicta un estudio o pide un ajuste al informe…")
 
     generar_ahora = st.session_state.pop("_generar_ahora", False)
@@ -343,8 +453,8 @@ def main():
             st.markdown(prompt)
 
     if generar_ahora:
-        if not st.session_state.api_key:
-            st.error("Falta configurar tu OpenAI API key en la barra lateral.")
+        if not st.session_state.deepseek_api_key:
+            st.error("Falta configurar tu DeepSeek API key en la barra lateral.")
         else:
             with st.chat_message("assistant"):
                 try:
