@@ -7,11 +7,10 @@ y edición iterativa de informes radiológicos estructurados
 Modelo de generación: DeepSeek (deepseek-chat / deepseek-reasoner), vía API
 compatible con OpenAI (base_url distinto).
 
-Transcripción por voz: reconocimiento de voz GRATUITO de Google (librería
-`SpeechRecognition`), sin necesidad de ninguna API key.
-
-Estilo personalizado: puedes subir un informe propio (.docx o .txt) como
-plantilla; BEAM lo usará como referencia de tu estilo de redacción.
+Transcripción por voz: reconocimiento de voz GRATUITO de Google, vía la
+librería `SpeechRecognition` (el mismo motor que usa Chrome) — sin API key
+ni costo adicional. Al grabar, se transcribe y se envía automáticamente
+al chat, sin pasos manuales.
 
 Requisitos:
     pip install streamlit openai audio-recorder-streamlit python-docx SpeechRecognition
@@ -35,9 +34,9 @@ except ImportError:
 
 try:
     import speech_recognition as sr
-    SR_DISPONIBLE = True
+    RECONOCIMIENTO_DISPONIBLE = True
 except ImportError:
-    SR_DISPONIBLE = False
+    RECONOCIMIENTO_DISPONIBLE = False
 
 try:
     from docx import Document
@@ -68,36 +67,60 @@ TERMINOLOGIA_CORRECTA = {
     "rasgadura": "desgarro",
 }
 
-SYSTEM_PROMPT = """Eres BEAM, un asistente conversacional experto en redacción e interpretación
-de informes radiológicos, para radiólogos en un contexto clínico mexicano. Trabajas dentro de
-un chat continuo: el radiólogo puede dictar un estudio, pedirte que generes el informe, y luego
-pedirte ajustes, ampliaciones, correcciones de estilo, comparaciones con estudios previos,
-explicaciones sobre clasificaciones, o cualquier otra consulta relacionada con el caso. Responde
-siempre en español.
+SYSTEM_PROMPT = """Eres BEAM, un radiólogo experto de altísimo nivel clínico, que redacta e
+interpreta informes radiológicos dentro de un chat continuo, para radiólogos en un contexto
+clínico mexicano. El radiólogo puede dictar un estudio, pedirte que generes el informe, y luego
+pedirte ajustes, reformulaciones, ampliaciones, comparaciones con estudios previos, o dudas sobre
+clasificaciones. Respondes siempre en español, con el criterio y la voz de un radiólogo senior.
 
-CUANDO GENERES UN INFORME RADIOLÓGICO, usa exclusivamente estas tres secciones, en mayúsculas
-como encabezado, en prosa narrativa continua (nunca listas ni fragmentos telegráficos):
+FORMATO DEL INFORME
+Usa exclusivamente estas tres secciones, en mayúsculas como encabezado, en prosa narrativa
+continua (nunca listas ni fragmentos telegráficos):
 
 TÉCNICA
 HALLAZGOS
 CONCLUSIÓN
 
-Reglas terminológicas estrictas (aplican siempre, en informes y en conversación):
+NIVEL CLÍNICO Y COMPLETITUD (regla central)
+El radiólogo casi siempre dicta solo los hallazgos POSITIVOS (patológicos). Tu trabajo, igual
+que el de un radiólogo humano al firmar un estudio, es entregar un informe COMPLETO Y
+SISTEMÁTICO de todas las estructuras relevantes evaluadas de rutina en ese tipo de estudio:
+- Debes inferir y redactar explícitamente el estado NORMAL de las estructuras no mencionadas,
+  siguiendo el protocolo estándar de revisión para esa modalidad y región anatómica (p. ej. en
+  una RM de rodilla: si solo te dictan "desgarro de menisco medial", también debes describir
+  el estado de ligamentos cruzados y colaterales, el menisco lateral, el cartílago articular,
+  los compartimentos, la alineación, los tejidos blandos periarticulares y la presencia o
+  ausencia de derrame, aunque no se hayan mencionado).
+- NUNCA inventes hallazgos patológicos, mediciones o datos que no fueron dictados o que no son
+  clínicamente deducibles del contexto (edad, lateralidad, tipo de estudio).
+- SÍ debes generar, con criterio experto, las descripciones normales/negativas pertinentes,
+  exactamente como lo haría un radiólogo experimentado al dictar de forma completa.
+- Sé exhaustivo, ordenado por regiones o sistemas (no aleatorio), y usa terminología radiológica
+  profesional, precisa y de alto nivel, en registro formal mexicano.
+- La CONCLUSIÓN debe ser jerárquica: el hallazgo principal primero, seguido de hallazgos
+  incidentales relevantes si los hay. Si aplica un sistema de clasificación (BI-RADS, PI-RADS,
+  TI-RADS, LI-RADS, Kellgren-Lawrence, Pfirrmann, Stoller, ICRS, Fleischner, Spetzler-Martin,
+  TOAST, AAST, etc.), inclúyelo con su categoría/grado exacto.
+
+REGLAS TERMINOLÓGICAS ESTRICTAS (siempre)
 - Usa "osteoartrosis", nunca "osteoartritis".
 - Usa "desgarro", nunca "ruptura" o "rasgadura" (tendón/menisco).
-- Mantén un registro clínico formal, preciso y conciso.
-- No inventes hallazgos que no estén mencionados o implícitos en el dictado.
-- Si el dictado o el caso involucra sistemas de clasificación (BI-RADS, PI-RADS, TI-RADS,
-  LI-RADS, Kellgren-Lawrence, Pfirrmann, Stoller, ICRS, Fleischner, Spetzler-Martin, TOAST, AAST),
-  inclúyelos correctamente en la CONCLUSIÓN, con el grado/categoría correspondiente.
 
-CUANDO CONVERSES (ediciones, dudas, comparaciones, explicaciones): responde de forma directa y
-clínica, sin preámbulos innecesarios. Si el radiólogo pide un cambio sobre un informe ya
-generado, entrega el informe completo actualizado (no solo el fragmento cambiado), salvo que
-pida explícitamente solo una explicación.
+REFORMULACIÓN Y EDICIÓN
+El radiólogo puede pedirte reformular solo los HALLAZGOS, solo la CONCLUSIÓN, o el informe
+completo, con una redacción distinta pero preservando el mismo contenido clínico y las mismas
+conclusiones diagnósticas (salvo que pida explícitamente cambiar el diagnóstico). Cuando se
+pida una reformulación:
+- Cambia estructura de frase, sinónimos y orden, no solo palabras sueltas.
+- Entrega la sección completa reformulada (o el informe completo si así se pidió), lista para
+  usarse, no un fragmento ni una explicación de los cambios.
+- Si el radiólogo pide varias opciones/alternativas, numéralas claramente (Opción 1, Opción 2...).
 
-Si el mensaje del usuario es claramente un dictado (texto libre describiendo un estudio de
-imagen), genera directamente el informe estructurado sin pedir confirmación.
+CONVERSACIÓN GENERAL
+Para dudas, comparaciones o explicaciones, responde de forma directa y clínica, sin preámbulos
+innecesarios. Si el mensaje del usuario es claramente un dictado (texto libre describiendo un
+estudio de imagen), genera directamente el informe estructurado y completo, sin pedir
+confirmación.
 """
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -154,21 +177,21 @@ def _init_estado():
             {
                 "role": "assistant",
                 "content": (
-                    "Hola, soy **BEAM**. Dicta o pega la descripción de un estudio y te "
-                    "genero el informe (TÉCNICA / HALLAZGOS / CONCLUSIÓN). También puedes "
-                    "pedirme ajustes, comparaciones o dudas sobre clasificaciones, todo en "
-                    "esta misma conversación."
+                    "Hola, soy **BEAM**. Dicta o pega los hallazgos de un estudio y te "
+                    "entrego el informe completo (TÉCNICA / HALLAZGOS / CONCLUSIÓN), "
+                    "incluyendo la descripción sistemática del resto de estructuras normales. "
+                    "Después puedes pedirme que reformule hallazgos, conclusión, o cualquier "
+                    "ajuste, todo en esta misma conversación."
                 ),
             }
         ]
     st.session_state.setdefault("deepseek_api_key", os.environ.get("DEEPSEEK_API_KEY", ""))
-    st.session_state.setdefault("transcripcion_pendiente", "")
-    st.session_state.setdefault("plantilla_texto", "")
     st.session_state.setdefault("tema_nombre", "Dorado (original)")
     st.session_state.setdefault("fuente_nombre", "Inter (sans, default)")
     st.session_state.setdefault(
         "color_acento_custom", TEMAS[st.session_state.get("tema_nombre", "Dorado (original)")]["accent"]
     )
+    st.session_state.setdefault("_ultimo_audio_procesado", None)
 
 
 def aplicar_terminologia(texto: str) -> str:
@@ -254,15 +277,6 @@ def inyectar_estilo(tema: dict, fuente_css: str):
         [data-testid="stChatInput"] textarea {{
             font-family: {fuente_css};
         }}
-
-        .swatch-preview {{
-            display: inline-block;
-            width: 14px; height: 14px;
-            border-radius: 4px;
-            margin-right: 6px;
-            vertical-align: middle;
-            border: 1px solid var(--border);
-        }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -274,52 +288,11 @@ def inyectar_estilo(tema: dict, fuente_css: str):
 # ──────────────────────────────────────────────────────────────────────────
 
 def transcribir_audio(audio_bytes: bytes) -> str:
-    """Transcribe audio a texto usando el reconocimiento de voz gratuito de
-    Google Web Speech API (vía la librería `SpeechRecognition`). No requiere
-    ninguna API key."""
+    """Transcribe usando el motor gratuito de Google (SpeechRecognition), sin API key."""
     reconocedor = sr.Recognizer()
-    buffer_audio = io.BytesIO(audio_bytes)
-    with sr.AudioFile(buffer_audio) as fuente:
+    with sr.AudioFile(io.BytesIO(audio_bytes)) as fuente:
         datos_audio = reconocedor.record(fuente)
-    try:
-        return reconocedor.recognize_google(datos_audio, language="es-MX").strip()
-    except sr.UnknownValueError:
-        return ""
-    except sr.RequestError as e:
-        raise RuntimeError(f"No se pudo contactar al servicio de reconocimiento de Google: {e}")
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# PLANTILLA DE ESTILO DEL RADIÓLOGO
-# ──────────────────────────────────────────────────────────────────────────
-
-def extraer_texto_plantilla(archivo) -> str:
-    """Extrae el texto de un informe subido como referencia de estilo (.docx o .txt)."""
-    nombre = archivo.name.lower()
-    if nombre.endswith(".docx"):
-        if not DOCX_DISPONIBLE:
-            raise RuntimeError("Instala `python-docx` para leer archivos .docx.")
-        documento = Document(archivo)
-        parrafos = [p.text for p in documento.paragraphs if p.text.strip()]
-        return "\n".join(parrafos)
-    return archivo.read().decode("utf-8", errors="ignore")
-
-
-def construir_system_prompt() -> str:
-    prompt = SYSTEM_PROMPT
-    plantilla = st.session_state.get("plantilla_texto", "")
-    if plantilla:
-        fragmento = plantilla[:6000]
-        prompt += (
-            "\n\nEl radiólogo ha compartido uno de sus informes previos como referencia de su "
-            "estilo personal de redacción (vocabulario habitual, orden interno de las secciones, "
-            "nivel de detalle, giros de frase). Adapta la redacción de TÉCNICA, HALLAZGOS y "
-            "CONCLUSIÓN a ese estilo siempre que sea coherente con las reglas terminológicas "
-            "anteriores, sin copiar datos clínicos de este ejemplo (corresponde a otro paciente, "
-            "es solo una referencia de forma):\n\n"
-            f"--- EJEMPLO DE ESTILO DEL RADIÓLOGO ---\n{fragmento}\n--- FIN DEL EJEMPLO ---"
-        )
-    return prompt
+    return reconocedor.recognize_google(datos_audio, language="es-MX").strip()
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -329,7 +302,7 @@ def construir_system_prompt() -> str:
 def generar_respuesta(modelo: str):
     cliente = obtener_cliente_deepseek()
 
-    historial_api = [{"role": "system", "content": construir_system_prompt()}] + [
+    historial_api = [{"role": "system", "content": SYSTEM_PROMPT}] + [
         {"role": m["role"], "content": m["content"]} for m in st.session_state.mensajes
     ]
 
@@ -348,6 +321,36 @@ def generar_respuesta(modelo: str):
                 yield texto
 
     return generador
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# EXPORTAR A WORD
+# ──────────────────────────────────────────────────────────────────────────
+
+def exportar_docx(texto: str) -> bytes:
+    documento = Document()
+    for linea in texto.split("\n"):
+        if linea.strip().upper() in ("TÉCNICA", "HALLAZGOS", "CONCLUSIÓN"):
+            documento.add_heading(linea.strip(), level=2)
+        elif linea.strip():
+            documento.add_paragraph(linea.strip())
+    buffer = io.BytesIO()
+    documento.save(buffer)
+    return buffer.getvalue()
+
+
+def ultimo_mensaje_asistente() -> str:
+    for m in reversed(st.session_state.mensajes):
+        if m["role"] == "assistant":
+            return m["content"]
+    return ""
+
+
+def solicitar_reformulacion(instruccion: str):
+    """Agrega una instrucción de reformulación como mensaje de usuario y dispara la generación."""
+    st.session_state.mensajes.append({"role": "user", "content": instruccion})
+    st.session_state["_generar_ahora"] = True
+    st.rerun()
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -402,83 +405,85 @@ def main():
 
         st.divider()
 
-        with st.expander("🎙️ Dictado por voz (gratuito, Google)"):
-            st.caption(
-                "Transcripción con el reconocimiento de voz gratuito de Google. "
-                "No requiere ninguna API key."
+        if AUDIO_DISPONIBLE and RECONOCIMIENTO_DISPONIBLE:
+            st.caption("🎙️ Dictado por voz · gratuito (Google)")
+            audio_bytes = audio_recorder(
+                text="",
+                recording_color=st.session_state.color_acento_custom,
+                neutral_color="#2A2A2E",
+                icon_size="2x",
+                pause_threshold=2.0,
+                key="grabadora",
             )
-            if not SR_DISPONIBLE:
-                st.caption("Instala `SpeechRecognition` (`pip install SpeechRecognition`) para habilitar esta función.")
-            elif not AUDIO_DISPONIBLE:
-                st.caption("Instala `audio-recorder-streamlit` para habilitar esta función.")
-            else:
-                audio_bytes = audio_recorder(
-                    text="",
-                    recording_color=st.session_state.color_acento_custom,
-                    neutral_color="#2A2A2E",
-                    icon_size="2x",
-                    pause_threshold=2.0,
-                    key="grabadora",
-                )
-                if audio_bytes:
-                    with st.spinner("Transcribiendo…"):
-                        try:
-                            texto_transcrito = transcribir_audio(audio_bytes)
-                            if texto_transcrito:
-                                st.session_state.transcripcion_pendiente = texto_transcrito
-                            else:
-                                st.warning("No se detectó voz reconocible en el audio.")
-                        except Exception as e:
-                            st.error(f"Error al transcribir: {e}")
-
-                if st.session_state.transcripcion_pendiente:
-                    st.text_area(
-                        "Transcripción (editable, envíala desde el chat)",
-                        key="transcripcion_pendiente", height=140,
-                    )
-                    if st.button("Enviar transcripción al chat", use_container_width=True):
-                        texto = st.session_state.transcripcion_pendiente
-                        st.session_state.transcripcion_pendiente = ""
-                        st.session_state.mensajes.append({"role": "user", "content": texto})
-                        st.session_state["_generar_ahora"] = True
-                        st.rerun()
+            # Procesa automáticamente en cuanto hay un audio nuevo: transcribe y
+            # lo envía al chat sin pasos manuales, igual que antes.
+            if audio_bytes and audio_bytes != st.session_state._ultimo_audio_procesado:
+                st.session_state._ultimo_audio_procesado = audio_bytes
+                with st.spinner("Transcribiendo (Google, gratis)…"):
+                    try:
+                        texto = transcribir_audio(audio_bytes)
+                        if texto:
+                            st.session_state.mensajes.append({"role": "user", "content": texto})
+                            st.session_state["_generar_ahora"] = True
+                            st.rerun()
+                        else:
+                            st.warning("No se detectó voz clara en la grabación.")
+                    except sr.UnknownValueError:
+                        st.warning("No se entendió el audio, intenta de nuevo.")
+                    except sr.RequestError as e:
+                        st.error(f"Error de conexión con el reconocimiento de Google: {e}")
+        elif not AUDIO_DISPONIBLE:
+            st.caption("Instala `audio-recorder-streamlit` para dictado por voz.")
+        elif not RECONOCIMIENTO_DISPONIBLE:
+            st.caption("Instala `SpeechRecognition` para dictado por voz.")
 
         st.divider()
 
-        with st.expander("📄 Tu plantilla de estilo", expanded=not st.session_state.plantilla_texto):
-            st.caption(
-                "Sube un informe tuyo ya redactado (.docx o .txt) para que BEAM aprenda tu "
-                "vocabulario, orden interno y estilo de redacción, y lo use en todos los "
-                "informes que genere."
+        ultimo = ultimo_mensaje_asistente()
+        if ultimo:
+            st.download_button(
+                "⬇️ Descargar último informe (.txt)",
+                data=ultimo,
+                file_name=f"informe_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.txt",
+                use_container_width=True,
             )
-            plantilla_archivo = st.file_uploader(
-                "Informe de referencia", type=["docx", "txt"], key="plantilla_uploader",
-            )
-            if plantilla_archivo is not None:
-                try:
-                    texto_plantilla = extraer_texto_plantilla(plantilla_archivo)
-                    if texto_plantilla.strip():
-                        st.session_state.plantilla_texto = texto_plantilla
-                        st.success(f"Plantilla cargada ({len(texto_plantilla)} caracteres).")
-                    else:
-                        st.warning("No se pudo extraer texto de ese archivo.")
-                except Exception as e:
-                    st.error(f"Error al leer la plantilla: {e}")
-
-            if st.session_state.plantilla_texto:
-                st.caption("✅ BEAM está usando tu plantilla como referencia de estilo.")
-                st.text_area(
-                    "Vista previa (solo lectura)",
-                    value=st.session_state.plantilla_texto[:2000],
-                    height=120, disabled=True,
+            if DOCX_DISPONIBLE:
+                st.download_button(
+                    "⬇️ Descargar último informe (.docx)",
+                    data=exportar_docx(ultimo),
+                    file_name=f"informe_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.docx",
+                    use_container_width=True,
                 )
-                if st.button("Quitar plantilla", use_container_width=True):
-                    st.session_state.plantilla_texto = ""
-                    st.rerun()
 
     for mensaje in st.session_state.mensajes:
         with st.chat_message(mensaje["role"]):
             st.markdown(mensaje["content"])
+
+    # ── Acciones rápidas de reformulación sobre el último informe ──────
+    if len(st.session_state.mensajes) > 1 and st.session_state.mensajes[-1]["role"] == "assistant":
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("🔁 Reformular hallazgos", use_container_width=True):
+                solicitar_reformulacion(
+                    "Reformula únicamente la sección de HALLAZGOS del informe anterior, con "
+                    "redacción distinta (estructura de frase y sinónimos), preservando "
+                    "exactamente el mismo contenido clínico. Entrega el informe completo "
+                    "actualizado."
+                )
+        with col2:
+            if st.button("🔁 Reformular conclusión", use_container_width=True):
+                solicitar_reformulacion(
+                    "Reformula únicamente la sección de CONCLUSIÓN del informe anterior, con "
+                    "redacción distinta, preservando el mismo diagnóstico y la misma "
+                    "clasificación si aplica. Entrega el informe completo actualizado."
+                )
+        with col3:
+            if st.button("🔁 Dos opciones de conclusión", use_container_width=True):
+                solicitar_reformulacion(
+                    "Dame dos opciones distintas de redacción para la CONCLUSIÓN del informe "
+                    "anterior (Opción 1 y Opción 2), con el mismo contenido diagnóstico pero "
+                    "estilo distinto, para que yo elija."
+                )
 
     prompt = st.chat_input("Dicta un estudio o pide un ajuste al informe…")
 
@@ -505,6 +510,7 @@ def main():
                     texto_final = f"Ocurrió un error al generar la respuesta: {e}"
                     st.error(texto_final)
             st.session_state.mensajes.append({"role": "assistant", "content": texto_final})
+            st.rerun()
 
 
 if __name__ == "__main__":
