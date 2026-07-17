@@ -1,57 +1,58 @@
 """
-BEAM — Asistente Conversacional de Interpretación Radiológica
-Interfaz de chat (estilo ChatGPT / Claude / Gemini) para dictado, redacción
-y edición iterativa de informes radiológicos estructurados
-(TÉCNICA / HALLAZGOS / CONCLUSIÓN).
+BEAM — Workspace de informes radiológicos asistidos por IA (v2.0, Parte A)
 
-Modelo de generación: DeepSeek (deepseek-chat / deepseek-reasoner), vía API
-compatible con OpenAI (base_url distinto).
+Editor de tres secciones (TÉCNICA / HALLAZGOS / CONCLUSIÓN) con motor de
+reformulación por estilos (clínico, académico, conciso, elegante, RSNA,
+ESSR, AJR, profesor). El informe es el protagonista: se genera a partir
+de un dictado o texto libre y queda como documento editable, no como
+hilo de chat.
 
-Dictado por voz: 100% en el navegador, usando la Web Speech API nativa de
-Chrome/Edge (webkitSpeechRecognition). No requiere ningún paquete de Python
-adicional ni ninguna API key: el reconocimiento corre del lado del cliente
-y el texto se escribe en tiempo real en el cuadro de chat.
-
-Estilo personalizado: puedes subir un informe propio (.docx o .txt) como
-plantilla; BEAM lo usará como referencia de tu estilo de redacción.
+Dictado por voz: Web Speech API nativa del navegador (Chrome/Edge). No
+requiere ningún paquete ni API key adicional — corre 100% en el cliente.
 
 Requisitos:
-    pip install streamlit openai python-docx
+    pip install streamlit openai
 
 Ejecutar:
     streamlit run app.py
+
+Necesitas una API key de DeepSeek (https://platform.deepseek.com),
+configurable una sola vez desde "Configuración" en la barra lateral.
 """
 
+import json
 import os
-import io
-import datetime
+import re
+from typing import Iterator
 
 import streamlit as st
 import streamlit.components.v1 as components
 from openai import OpenAI
 
-try:
-    from docx import Document
-    DOCX_DISPONIBLE = True
-except ImportError:
-    DOCX_DISPONIBLE = False
-
-# ──────────────────────────────────────────────────────────────────────────
-# CONFIGURACIÓN GENERAL
-# ──────────────────────────────────────────────────────────────────────────
-
-st.set_page_config(
-    page_title="BEAM · Asistente Radiológico",
-    page_icon="🩻",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+# ══════════════════════════════════════════════════════════════════════════
+# CONFIGURACIÓN
+# ══════════════════════════════════════════════════════════════════════════
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+MODELO_DEFECTO = "deepseek-chat"
 MODELOS_DEEPSEEK = {
-    "deepseek-chat": "DeepSeek Chat (V3)",
-    "deepseek-reasoner": "DeepSeek Reasoner (R1)",
+    "deepseek-chat": "DeepSeek Chat (V3) — rápido, uso diario",
+    "deepseek-reasoner": "DeepSeek Reasoner (R1) — casos complejos",
 }
+
+# Paleta "grafito clínico": neutros + un único acento discreto (azul acero).
+PALETA = {
+    "bg": "#0B0C0E",
+    "surface": "#141518",
+    "surface_alt": "#1B1C20",
+    "border": "#26272B",
+    "text": "#EDEDEF",
+    "muted": "#8B8D93",
+    "accent": "#5B8AA0",
+    "accent_soft": "#5B8AA026",
+}
+
+FUENTE_UI = "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
 
 TERMINOLOGIA_CORRECTA = {
     "osteoartritis": "osteoartrosis",
@@ -59,133 +60,132 @@ TERMINOLOGIA_CORRECTA = {
     "rasgadura": "desgarro",
 }
 
-SYSTEM_PROMPT = """Eres BEAM, un asistente conversacional experto en redacción e interpretación
-de informes radiológicos, equivalente a un radiólogo con amplia experiencia clínica en un
-contexto mexicano. Trabajas dentro de un chat continuo: el radiólogo puede dictar un estudio,
-pedirte que generes el informe, y luego pedirte ajustes, ampliaciones, correcciones de estilo,
-comparaciones con estudios previos, explicaciones sobre clasificaciones, reformulaciones
-alternativas, o cualquier otra consulta relacionada con el caso. Responde siempre en español.
+SYSTEM_PROMPT_BASE = """Eres BEAM, un radiólogo experto redactando informes para un contexto
+clínico mexicano. No eres un chatbot: eres el motor de redacción de un workspace de informes.
+Cuando recibas hallazgos dictados o escritos por el radiólogo, generas directamente el informe
+completo, sin preámbulos, sin confirmaciones, sin explicaciones adicionales — solo el informe.
 
-CUANDO GENERES UN INFORME RADIOLÓGICO, usa exclusivamente estas tres secciones, en mayúsculas
-como encabezado, en prosa narrativa continua (nunca listas ni fragmentos telegráficos):
+Usa exclusivamente estas tres secciones, en mayúsculas como encabezado en su propia línea,
+en prosa narrativa continua (nunca listas ni fragmentos telegráficos):
 
 TÉCNICA
 HALLAZGOS
 CONCLUSIÓN
 
-NIVEL DE DETALLE Y CRITERIO CLÍNICO (muy importante):
-- Redacta como lo haría un radiólogo experto dictando un caso completo, no como una simple
-  transcripción de lo que el usuario dictó.
-- El radiólogo normalmente solo te dictará los hallazgos POSITIVOS o relevantes. A partir de
-  ahí, debes completar tú, de forma sistemática, la descripción del resto de las estructuras
-  que se evalúan de rutina en ese tipo de estudio y región anatómica (revisión por sistemas /
-  "negativa pertinente"), describiéndolas como normales, EXCEPTO cuando el dictado indique
-  lo contrario o cuando la técnica descrita no permita evaluarlas (en cuyo caso acláralo).
-  Por ejemplo: si te dictan solo "quiste renal derecho de 2 cm" en un estudio de abdomen,
-  la sección HALLAZGOS debe además describir de forma normal el resto de estructuras
-  habitualmente evaluadas en ese estudio (hígado, vía biliar, páncreas, bazo, riñón
-  contralateral, retroperitoneo, etc., según la modalidad y el protocolo), no limitarse a
-  mencionar únicamente el quiste.
-- NUNCA inventes hallazgos PATOLÓGICOS que no estén mencionados o claramente implícitos en el
-  dictado. La inferencia permitida es únicamente hacia la normalidad de estructuras no
-  mencionadas explícitamente, nunca hacia nuevas patologías.
-- La CONCLUSIÓN debe ser concisa y limitarse a los hallazgos clínicamente relevantes (no repitas
-  ahí la revisión de estructuras normales); prioriza por relevancia clínica cuando haya más de
-  un hallazgo, y usa lenguaje de cierre diagnóstico apropiado (correlación clínica, sugerencias
-  de seguimiento o estudios adicionales cuando corresponda).
+NIVEL DE DETALLE Y CRITERIO CLÍNICO:
+- Redacta como lo haría un radiólogo experto (nivel fellow), no como una transcripción literal
+  de lo dictado.
+- El radiólogo normalmente solo dictará los hallazgos POSITIVOS o relevantes. Completa tú, de
+  forma sistemática, la descripción del resto de estructuras evaluadas de rutina en ese tipo de
+  estudio (revisión por sistemas / "negativa pertinente"), describiéndolas como normales, EXCEPTO
+  cuando el dictado indique lo contrario o la técnica no permita evaluarlas.
+- NUNCA inventes hallazgos PATOLÓGICOS no mencionados o claramente implícitos. La inferencia
+  permitida es únicamente hacia la normalidad de estructuras no mencionadas explícitamente.
+- CONCLUSIÓN debe ser concisa, limitada a lo clínicamente relevante, priorizada, con lenguaje
+  de cierre diagnóstico apropiado (correlación clínica, seguimiento, estudios adicionales).
 
-Reglas terminológicas estrictas (aplican siempre, en informes y en conversación):
+TERMINOLOGÍA ESTRICTA (aplica siempre):
 - Usa "osteoartrosis", nunca "osteoartritis".
 - Usa "desgarro", nunca "ruptura" o "rasgadura" (tendón/menisco).
-- Mantén un registro clínico formal, preciso y conciso.
-- Si el dictado o el caso involucra sistemas de clasificación (BI-RADS, PI-RADS, TI-RADS,
-  LI-RADS, Kellgren-Lawrence, Pfirrmann, Stoller, ICRS, Fleischner, Spetzler-Martin, TOAST, AAST),
-  inclúyelos correctamente en la CONCLUSIÓN, con el grado/categoría correspondiente.
+- Si el caso involucra sistemas de clasificación (BI-RADS, PI-RADS, TI-RADS, LI-RADS,
+  Kellgren-Lawrence, Pfirrmann, Stoller, ICRS, Fleischner, Spetzler-Martin, TOAST, AAST),
+  inclúyelos correctamente en CONCLUSIÓN con el grado/categoría correspondiente.
 
-REFORMULACIONES Y ALTERNATIVAS: si el radiólogo pide "alternativas", "otras opciones" u
-"otras formas de redactar" para HALLAZGOS, CONCLUSIÓN, o el informe completo, genera 2 o 3
-versiones distintas, numeradas claramente (Opción 1, Opción 2, ...), que preserven exactamente
-el mismo contenido clínico (mismos hallazgos, mismo grado/categoría de clasificación si aplica)
-mostrando solo variación de estilo, orden y construcción de las frases — nunca cambies ni el
-diagnóstico ni el sentido clínico entre opciones.
-
-CUANDO CONVERSES (ediciones, dudas, comparaciones, explicaciones): responde de forma directa y
-clínica, sin preámbulos innecesarios. Si el radiólogo pide un cambio sobre un informe ya
-generado (que no sea una solicitud explícita de alternativas), entrega el informe completo
-actualizado (no solo el fragmento cambiado), salvo que pida explícitamente solo una explicación.
-
-Si el mensaje del usuario es claramente un dictado (texto libre describiendo un estudio de
-imagen), genera directamente el informe estructurado y detallado, sin pedir confirmación.
+Responde siempre en español, y responde ÚNICAMENTE con el informe (TÉCNICA/HALLAZGOS/CONCLUSIÓN),
+sin texto antes ni después.
 """
 
-# ──────────────────────────────────────────────────────────────────────────
-# TEMAS DE COLOR Y TIPOGRAFÍAS
-# ──────────────────────────────────────────────────────────────────────────
-
-TEMAS = {
-    "Dorado (original)": {
-        "accent": "#E8B84B", "bg": "#111112", "surface": "#18181B",
-        "border": "#2A2A2E", "text": "#E8E8E8", "muted": "#9A9A9E",
+# Motor de estilos: cada uno es una restricción estructural verificable,
+# no un adjetivo vago — por eso los resultados suenan realmente distintos.
+ESTILOS_REDACCION = {
+    "clinico": {
+        "nombre": "Clínico directo",
+        "descripcion": "Oraciones cortas, datos medibles por delante.",
+        "instruccion": (
+            "Oraciones cortas (máximo ~20 palabras), voz activa cuando sea posible, cero "
+            "adjetivos ornamentales, prioriza datos medibles sobre descripciones narrativas."
+        ),
     },
-    "Esmeralda": {
-        "accent": "#34D399", "bg": "#0F1512", "surface": "#161C19",
-        "border": "#233029", "text": "#E5EFE9", "muted": "#8FA79B",
+    "academico": {
+        "nombre": "Académico",
+        "descripcion": "Registro de discusión de caso en sesión clínica.",
+        "instruccion": (
+            "Oraciones compuestas con conectores subordinantes (dado que, en tanto que, lo cual "
+            "sugiere), terminología completa sin abreviar, tono de discusión de caso en sesión "
+            "clínica o ateneo."
+        ),
     },
-    "Zafiro": {
-        "accent": "#5B9DF9", "bg": "#0E1116", "surface": "#161A21",
-        "border": "#232838", "text": "#E6EAF2", "muted": "#8C97AD",
+    "conciso": {
+        "nombre": "Ultra conciso",
+        "descripcion": "Mínima extensión posible sin perder datos.",
+        "instruccion": (
+            "Reduce cada oración a su núcleo informativo. Elimina toda redundancia y frase de "
+            "relleno. Objetivo: no más del 60% de la longitud original en caracteres, sin perder "
+            "ni un solo dato clínico."
+        ),
     },
-    "Violeta": {
-        "accent": "#B893F0", "bg": "#131018", "surface": "#1B1622",
-        "border": "#2C2436", "text": "#ECE6F2", "muted": "#A497AF",
+    "elegante": {
+        "nombre": "Elegante",
+        "descripcion": "Fluido, con variación de estructura entre oraciones.",
+        "instruccion": (
+            "Varía la longitud y estructura de las oraciones para evitar monotonía, usa "
+            "transiciones fluidas entre ideas, mantiene precisión clínica sin sonar telegráfico "
+            "ni sobrecargado."
+        ),
     },
-    "Grafito claro": {
-        "accent": "#C6922A", "bg": "#F7F7F5", "surface": "#FFFFFF",
-        "border": "#E3E3E0", "text": "#1A1A1A", "muted": "#6B6B68",
+    "rsna": {
+        "nombre": "Estilo RSNA (Radiology)",
+        "descripcion": "Objetivo e impersonal, secuencia anatómica sistemática.",
+        "instruccion": (
+            "Registro de journal RSNA: objetivo, impersonal, con secuencia anatómica sistemática "
+            "(de superior a inferior o de proximal a distal), sin lenguaje coloquial."
+        ),
+    },
+    "essr": {
+        "nombre": "Estilo ESSR",
+        "descripcion": "Preciso en grados/clasificaciones musculoesqueléticas.",
+        "instruccion": (
+            "Registro europeo musculoesquelético: preciso en grados y clasificaciones (Goutallier, "
+            "ICRS, Pfirrmann, etc.), frases breves y directas, sin narrativa innecesaria."
+        ),
+    },
+    "ajr": {
+        "nombre": "Estilo AJR",
+        "descripcion": "Contextualiza antes de describir, cierra con implicancia clínica.",
+        "instruccion": (
+            "Tono editorial de caso ilustrativo: contextualiza brevemente el hallazgo antes de "
+            "describirlo en detalle, y cierra con su implicancia clínica explícita."
+        ),
+    },
+    "profesor": {
+        "nombre": "Profesor de alta especialidad",
+        "descripcion": "Enseña el razonamiento diagnóstico sin extenderse.",
+        "instruccion": (
+            "Redacta como si enseñaras el caso a un residente: menciona brevemente el "
+            "razonamiento diagnóstico detrás del hallazgo principal (por qué esa impresión y no "
+            "otra), sin extenderte más de una oración adicional por hallazgo relevante."
+        ),
     },
 }
+ORDEN_ESTILOS = ["clinico", "academico", "conciso", "elegante", "rsna", "essr", "ajr", "profesor"]
 
-FUENTES = {
-    "Inter (sans, default)": "'Inter', sans-serif",
-    "Space Grotesk (sans)": "'Space Grotesk', sans-serif",
-    "Sistema (estilo Söhne/SF)": "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-    "JetBrains Mono (mono)": "'JetBrains Mono', monospace",
-    "IBM Plex Mono (mono)": "'IBM Plex Mono', monospace",
-}
+NOMBRE_SECCION = {"tecnica": "TÉCNICA", "hallazgos": "HALLAZGOS", "conclusion": "CONCLUSIÓN"}
+ETIQUETA_CAPTURA = "Dictado o hallazgos"
 
-GOOGLE_FONTS_IMPORT = (
-    "@import url('https://fonts.googleapis.com/css2?"
-    "family=Inter:wght@400;500;600;700&"
-    "family=Space+Grotesk:wght@400;500;600;700&"
-    "family=JetBrains+Mono:wght@400;500;600&"
-    "family=IBM+Plex+Mono:wght@400;500;600&"
-    "display=swap');"
+st.set_page_config(
+    page_title="BEAM · Workspace radiológico",
+    page_icon="◆",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# ──────────────────────────────────────────────────────────────────────────
-# ESTADO DE SESIÓN
-# ──────────────────────────────────────────────────────────────────────────
 
-def _init_estado():
-    if "mensajes" not in st.session_state:
-        st.session_state.mensajes = [
-            {
-                "role": "assistant",
-                "content": (
-                    "Hola, soy **BEAM**. Dicta o pega la descripción de un estudio y te "
-                    "genero el informe (TÉCNICA / HALLAZGOS / CONCLUSIÓN). También puedes "
-                    "pedirme ajustes, comparaciones o dudas sobre clasificaciones, todo en "
-                    "esta misma conversación."
-                ),
-            }
-        ]
-    st.session_state.setdefault("deepseek_api_key", os.environ.get("DEEPSEEK_API_KEY", ""))
-    st.session_state.setdefault("plantilla_texto", "")
-    st.session_state.setdefault("tema_nombre", "Dorado (original)")
-    st.session_state.setdefault("fuente_nombre", "Inter (sans, default)")
-    st.session_state.setdefault(
-        "color_acento_custom", TEMAS[st.session_state.get("tema_nombre", "Dorado (original)")]["accent"]
-    )
+# ══════════════════════════════════════════════════════════════════════════
+# CAPA DE GENERACIÓN (DeepSeek, vía SDK compatible con OpenAI)
+# ══════════════════════════════════════════════════════════════════════════
+
+def obtener_cliente(api_key: str) -> OpenAI:
+    return OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
 
 
 def aplicar_terminologia(texto: str) -> str:
@@ -195,90 +195,226 @@ def aplicar_terminologia(texto: str) -> str:
     return texto
 
 
-def obtener_cliente_deepseek() -> OpenAI:
-    return OpenAI(api_key=st.session_state.deepseek_api_key, base_url=DEEPSEEK_BASE_URL)
+def generar_informe_stream(api_key: str, dictado: str, modelo: str = MODELO_DEFECTO) -> Iterator[str]:
+    cliente = obtener_cliente(api_key)
+    stream = cliente.chat.completions.create(
+        model=modelo,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT_BASE},
+            {"role": "user", "content": dictado},
+        ],
+        temperature=0.2,
+        stream=True,
+    )
+    for fragmento in stream:
+        delta = fragmento.choices[0].delta
+        texto = getattr(delta, "content", None) or ""
+        if texto:
+            yield texto
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# ESTILO — TEMA DINÁMICO (COLOR + TIPOGRAFÍA)
-# ──────────────────────────────────────────────────────────────────────────
+_PATRON_ENCABEZADO = re.compile(
+    r"(?im)^\s*(T[ÉE]CNICA|HALLAZGOS|CONCLUSI[ÓO]N)\s*:?\s*$", re.MULTILINE
+)
 
-def inyectar_estilo(tema: dict, fuente_css: str):
+
+def parsear_informe(texto: str) -> dict:
+    partes = {}
+    coincidencias = list(_PATRON_ENCABEZADO.finditer(texto))
+    for i, m in enumerate(coincidencias):
+        clave = m.group(1).upper().replace("TECNICA", "TÉCNICA").replace("CONCLUSION", "CONCLUSIÓN")
+        inicio = m.end()
+        fin = coincidencias[i + 1].start() if i + 1 < len(coincidencias) else len(texto)
+        partes[clave] = texto[inicio:fin].strip()
+    return {
+        "tecnica": aplicar_terminologia(partes.get("TÉCNICA", "")),
+        "hallazgos": aplicar_terminologia(partes.get("HALLAZGOS", "")),
+        "conclusion": aplicar_terminologia(partes.get("CONCLUSIÓN", "")),
+    }
+
+
+def reconstruir_informe(informe: dict) -> str:
+    return (
+        f"TÉCNICA\n{informe.get('tecnica', '').strip()}\n\n"
+        f"HALLAZGOS\n{informe.get('hallazgos', '').strip()}\n\n"
+        f"CONCLUSIÓN\n{informe.get('conclusion', '').strip()}"
+    )
+
+
+def _prompt_reformulacion_seccion(seccion_nombre: str, seccion_texto: str, estilo_id: str) -> str:
+    estilo = ESTILOS_REDACCION[estilo_id]
+    return f"""Reescribe exclusivamente la sección {seccion_nombre} de un informe radiológico
+siguiendo este estilo:
+
+ESTILO OBJETIVO — {estilo['nombre']}
+{estilo['instruccion']}
+
+TEXTO ORIGINAL:
+{seccion_texto}
+
+REGLAS NO NEGOCIABLES:
+- No agregues, quites ni cambies ningún hallazgo, medida, lateralidad o clasificación.
+- Todo dato numérico, categoría (BI-RADS/PI-RADS/TNM/etc.) y lateralidad debe reaparecer idéntico.
+- Cambia únicamente: estructura de oración, longitud, conectores, orden de exposición, registro léxico.
+- Usa "osteoartrosis" (nunca "osteoartritis") y "desgarro" (nunca "ruptura"/"rasgadura").
+- Devuelve SOLO el texto reescrito de la sección, sin encabezados, comillas ni comentarios.
+
+Antes de responder, verifica mentalmente que cada dato clínico del original sigue presente."""
+
+
+def reformular_seccion(api_key: str, seccion_nombre: str, seccion_texto: str, estilo_id: str,
+                        modelo: str = MODELO_DEFECTO) -> str:
+    if not seccion_texto.strip():
+        return seccion_texto
+    cliente = obtener_cliente(api_key)
+    respuesta = cliente.chat.completions.create(
+        model=modelo,
+        messages=[
+            {"role": "system", "content": "Eres un editor experto de informes radiológicos en español."},
+            {"role": "user", "content": _prompt_reformulacion_seccion(seccion_nombre, seccion_texto, estilo_id)},
+        ],
+        temperature=0.4,
+    )
+    return aplicar_terminologia(respuesta.choices[0].message.content.strip())
+
+
+def _prompt_reformulacion_completa(informe_texto: str, estilo_id: str) -> str:
+    estilo = ESTILOS_REDACCION[estilo_id]
+    return f"""Reescribe el siguiente informe radiológico COMPLETO siguiendo este estilo:
+
+ESTILO OBJETIVO — {estilo['nombre']}
+{estilo['instruccion']}
+
+INFORME ORIGINAL:
+{informe_texto}
+
+REGLAS NO NEGOCIABLES:
+- Conserva exactamente las tres secciones (TÉCNICA, HALLAZGOS, CONCLUSIÓN) como encabezados
+  en mayúsculas, cada una en su propia línea.
+- No agregues, quites ni cambies ningún hallazgo, medida, lateralidad o clasificación.
+- Todo dato numérico, categoría y lateralidad debe reaparecer idéntico al original.
+- Cambia únicamente estructura, longitud, conectores y registro léxico — nunca el contenido clínico.
+- Usa "osteoartrosis" (nunca "osteoartritis") y "desgarro" (nunca "ruptura"/"rasgadura").
+- Debe leerse como si un radiólogo distinto, con ese estilo particular, hubiera redactado el
+  mismo caso — mismo diagnóstico, distinta voz."""
+
+
+def reformular_informe_completo(api_key: str, informe: dict, estilo_id: str,
+                                 modelo: str = MODELO_DEFECTO) -> dict:
+    cliente = obtener_cliente(api_key)
+    texto_original = reconstruir_informe(informe)
+    respuesta = cliente.chat.completions.create(
+        model=modelo,
+        messages=[
+            {"role": "system", "content": "Eres un editor experto de informes radiológicos en español."},
+            {"role": "user", "content": _prompt_reformulacion_completa(texto_original, estilo_id)},
+        ],
+        temperature=0.4,
+    )
+    return parsear_informe(respuesta.choices[0].message.content.strip())
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ESTADO DE SESIÓN
+# ══════════════════════════════════════════════════════════════════════════
+
+def init_estado():
+    st.session_state.setdefault("deepseek_api_key", os.environ.get("DEEPSEEK_API_KEY", ""))
+    st.session_state.setdefault("dictado_actual", "")
+    st.session_state.setdefault("informe", {"tecnica": "", "hallazgos": "", "conclusion": ""})
+    st.session_state.setdefault("estilo_ultimo_aplicado", {})
+
+
+def informe_esta_vacio() -> bool:
+    inf = st.session_state.informe
+    return not any((inf.get("tecnica"), inf.get("hallazgos"), inf.get("conclusion")))
+
+
+def limpiar_para_nuevo_estudio():
+    st.session_state.dictado_actual = ""
+    st.session_state.informe = {"tecnica": "", "hallazgos": "", "conclusion": ""}
+    st.session_state.estilo_ultimo_aplicado = {}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ESTILO VISUAL
+# ══════════════════════════════════════════════════════════════════════════
+
+GOOGLE_FONTS_IMPORT = (
+    "@import url('https://fonts.googleapis.com/css2?"
+    "family=Inter:wght@400;500;600;700&display=swap');"
+)
+
+
+def inyectar_estilo():
+    p = PALETA
     st.markdown(
         f"""
         <style>
         {GOOGLE_FONTS_IMPORT}
 
         :root {{
-            --accent: {tema['accent']};
-            --bg: {tema['bg']};
-            --surface: {tema['surface']};
-            --border: {tema['border']};
-            --text: {tema['text']};
-            --muted: {tema['muted']};
+            --bg: {p['bg']}; --surface: {p['surface']}; --surface-alt: {p['surface_alt']};
+            --border: {p['border']}; --text: {p['text']}; --muted: {p['muted']};
+            --accent: {p['accent']}; --accent-soft: {p['accent_soft']};
         }}
 
-        .stApp {{
-            background-color: var(--bg);
-            color: var(--text);
-            font-family: {fuente_css};
-        }}
+        .stApp {{ background-color: var(--bg); color: var(--text); font-family: {FUENTE_UI}; }}
 
         section[data-testid="stSidebar"] {{
-            background-color: var(--surface);
-            border-right: 1px solid var(--border);
+            background-color: var(--surface); border-right: 1px solid var(--border);
         }}
 
-        h1, h2, h3, .titulo-beam {{
-            font-family: {fuente_css};
+        .beam-header {{ display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 4px; }}
+        .beam-titulo-app {{ font-size: 1.05rem; font-weight: 600; color: var(--text); letter-spacing: -0.01em; }}
+        .beam-subtitulo-app {{ font-size: 0.78rem; color: var(--muted); }}
+
+        textarea, input[type="text"], input[type="password"] {{
+            background-color: var(--surface) !important;
+            color: var(--text) !important;
+            border: 1px solid var(--border) !important;
+            border-radius: 10px !important;
+            font-family: {FUENTE_UI} !important;
+        }}
+        textarea:focus, input:focus {{
+            border-color: var(--accent) !important;
+            box-shadow: 0 0 0 3px var(--accent-soft) !important;
+        }}
+        [data-testid="stTextArea"] textarea {{ font-size: 0.93rem; line-height: 1.65; }}
+
+        [data-testid="stWidgetLabel"] p {{
+            font-size: 0.72rem !important; font-weight: 600 !important;
+            letter-spacing: 0.1em !important; text-transform: uppercase !important;
+            color: var(--muted) !important;
         }}
 
-        .titulo-beam {{
-            font-weight: 700;
-            font-size: 1.7rem;
-            color: var(--accent);
-            letter-spacing: 0.5px;
+        div.stButton > button {{
+            background-color: var(--surface-alt); color: var(--text);
+            border: 1px solid var(--border); border-radius: 8px;
+            font-weight: 500; font-size: 0.84rem; padding: 0.4rem 0.9rem;
         }}
-        .subtitulo-beam {{
-            color: var(--muted);
-            font-size: 0.85rem;
-            margin-bottom: 1.2rem;
+        div.stButton > button:hover {{ border-color: var(--accent); color: var(--accent); }}
+        div.stButton > button[kind="primary"] {{
+            background-color: var(--accent); color: #0B0C0E; border: none; font-weight: 600;
         }}
+        div.stButton > button[kind="primary"]:hover {{ filter: brightness(1.08); color: #0B0C0E; }}
 
-        [data-testid="stChatMessage"] {{
-            background-color: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            font-family: {fuente_css};
-            font-size: 0.94rem;
-            line-height: 1.65;
-            color: var(--text);
-        }}
+        div[data-testid="stSelectbox"] > div {{ background-color: var(--surface); border-radius: 8px; }}
+        hr {{ border-color: var(--border) !important; }}
 
-        div.stButton > button, div.stDownloadButton > button {{
-            background-color: var(--accent);
-            color: var(--bg);
-            border: none;
-            border-radius: 8px;
-            font-weight: 600;
-            font-family: {fuente_css};
+        .beam-tarjeta {{
+            background-color: var(--surface); border: 1px solid var(--border);
+            border-radius: 14px; padding: 18px 20px; margin-bottom: 14px;
         }}
-        div.stButton > button:hover, div.stDownloadButton > button:hover {{
-            filter: brightness(1.1);
-            color: var(--bg);
+        .beam-caja-captura {{
+            background-color: var(--surface); border: 1px solid var(--border);
+            border-radius: 14px; padding: 14px 16px 10px 16px; margin-bottom: 22px;
         }}
-
-        [data-testid="stChatInput"] textarea {{
-            font-family: {fuente_css};
-        }}
-
-        .swatch-preview {{
-            display: inline-block;
-            width: 14px; height: 14px;
-            border-radius: 4px;
-            margin-right: 6px;
-            vertical-align: middle;
-            border: 1px solid var(--border);
+        .beam-badge {{
+            display: inline-block; font-size: 0.68rem; font-weight: 600;
+            letter-spacing: 0.05em; text-transform: uppercase;
+            color: var(--accent); background: var(--accent-soft);
+            border-radius: 6px; padding: 2px 8px; margin-left: 8px;
         }}
         </style>
         """,
@@ -286,53 +422,60 @@ def inyectar_estilo(tema: dict, fuente_css: str):
     )
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# DICTADO POR VOZ — WEB SPEECH API NATIVA DEL NAVEGADOR (SIN INSTALAR NADA)
-# ──────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# DICTADO POR VOZ — Web Speech API nativa del navegador
+# ══════════════════════════════════════════════════════════════════════════
 
-def widget_dictado_voz(color_acento: str):
-    """Ícono de micrófono con animación en vivo. Usa `webkitSpeechRecognition`
-    (Chrome/Edge) para transcribir en tiempo real y escribe el resultado
-    directamente en el cuadro de chat de Streamlit. No requiere backend."""
+def widget_dictado_voz(color_acento: str, etiqueta_objetivo: str, height: int = 56):
     html_code = f"""
-    <div id="beam-mic-wrap" style="display:flex;align-items:center;gap:10px;
-         font-family:sans-serif;padding:4px 2px 10px 2px;">
+    <div style="display:flex;align-items:center;gap:10px;font-family:sans-serif;">
       <button id="beam-mic-btn" title="Dictar" style="
-          width:46px;height:46px;border-radius:50%;border:none;cursor:pointer;
+          width:38px;height:38px;border-radius:50%;border:none;cursor:pointer;
           background:{color_acento};display:flex;align-items:center;justify-content:center;
           flex-shrink:0;">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="#111">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="#0B0C0E">
           <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3z"/>
           <path d="M19 11a1 1 0 1 0-2 0 5 5 0 0 1-10 0 1 1 0 1 0-2 0 7 7 0 0 0 6 6.92V21a1 1 0 1 0 2 0v-3.08A7 7 0 0 0 19 11z"/>
         </svg>
       </button>
-      <span id="beam-mic-estado" style="font-size:.85rem;color:#9A9A9E;">
-        Toca para dictar por voz
-      </span>
+      <span id="beam-mic-estado" style="font-size:.8rem;color:#8B8D93;">Dictar hallazgos</span>
     </div>
-
     <style>
       @keyframes beam-pulse {{
         0%   {{ box-shadow: 0 0 0 0 {color_acento}80; }}
-        70%  {{ box-shadow: 0 0 0 14px {color_acento}00; }}
+        70%  {{ box-shadow: 0 0 0 12px {color_acento}00; }}
         100% {{ box-shadow: 0 0 0 0 {color_acento}00; }}
       }}
-      #beam-mic-btn.escuchando {{
-        animation: beam-pulse 1.3s infinite;
-      }}
+      #beam-mic-btn.escuchando {{ animation: beam-pulse 1.3s infinite; }}
     </style>
-
     <script>
     (function() {{
       const btn = document.getElementById('beam-mic-btn');
       const estado = document.getElementById('beam-mic-estado');
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      const ETIQUETA = {etiqueta_objetivo!r};
 
       if (!SpeechRecognition) {{
-        estado.textContent = 'Tu navegador no soporta dictado por voz (usa Chrome o Edge).';
-        btn.disabled = true;
-        btn.style.opacity = 0.4;
+        estado.textContent = 'Dictado no soportado (usa Chrome o Edge)';
+        btn.disabled = true; btn.style.opacity = 0.4;
         return;
+      }}
+
+      function encontrarTextarea() {{
+        const doc = window.parent.document;
+        const contenedores = doc.querySelectorAll('[data-testid="stTextArea"]');
+        for (const c of contenedores) {{
+          if (c.innerText.includes(ETIQUETA)) return c.querySelector('textarea');
+        }}
+        return null;
+      }}
+
+      function escribir(texto) {{
+        const ta = encontrarTextarea();
+        if (!ta) return;
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+        setter.call(ta, texto);
+        ta.dispatchEvent(new Event('input', {{ bubbles: true }}));
       }}
 
       const recog = new SpeechRecognition();
@@ -340,158 +483,241 @@ def widget_dictado_voz(color_acento: str):
       recog.continuous = true;
       recog.interimResults = true;
 
-      let escuchando = false;
-      let detenidoManualmente = false;
-      let transcriptoFinal = '';
-
-      function setTextoStreamlit(texto) {{
-        try {{
-          const doc = window.parent.document;
-          const textarea = doc.querySelector('[data-testid="stChatInput"] textarea');
-          if (!textarea) return;
-          const setter = Object.getOwnPropertyDescriptor(
-            window.HTMLTextAreaElement.prototype, 'value'
-          ).set;
-          setter.call(textarea, texto);
-          textarea.dispatchEvent(new Event('input', {{ bubbles: true }}));
-        }} catch (e) {{ console.error('BEAM voz:', e); }}
-      }}
-
-      recog.onresult = function(evento) {{
-        let interino = '';
-        for (let i = evento.resultIndex; i < evento.results.length; i++) {{
-          const texto = evento.results[i][0].transcript;
-          if (evento.results[i].isFinal) {{
-            transcriptoFinal += texto + ' ';
-          }} else {{
-            interino += texto;
-          }}
-        }}
-        setTextoStreamlit((transcriptoFinal + interino).trim());
-      }};
-
-      recog.onerror = function(e) {{
-        estado.textContent = 'Error de reconocimiento: ' + e.error;
-      }};
-
-      recog.onend = function() {{
-        if (escuchando && !detenidoManualmente) {{
-          recog.start();  // el navegador a veces cierra solo; lo reanuda
-        }}
-      }};
+      let escuchando = false, detenidoManual = false, base = '', finalAcum = '';
 
       btn.addEventListener('click', function() {{
         escuchando = !escuchando;
         if (escuchando) {{
-          detenidoManualmente = false;
-          transcriptoFinal = '';
-          setTextoStreamlit('');
+          detenidoManual = false;
+          const ta = encontrarTextarea();
+          base = ta ? ta.value : '';
+          finalAcum = '';
           recog.start();
           btn.classList.add('escuchando');
-          estado.textContent = 'Escuchando… toca de nuevo para detener';
+          estado.textContent = 'Escuchando…';
         }} else {{
-          detenidoManualmente = true;
+          detenidoManual = true;
           recog.stop();
           btn.classList.remove('escuchando');
-          estado.textContent = 'Toca para dictar por voz';
+          estado.textContent = 'Dictar hallazgos';
         }}
       }});
+
+      recog.onresult = function(evento) {{
+        let interino = '';
+        for (let i = evento.resultIndex; i < evento.results.length; i++) {{
+          const t = evento.results[i][0].transcript;
+          if (evento.results[i].isFinal) finalAcum += t + ' ';
+          else interino += t;
+        }}
+        const separador = base && !base.endsWith(' ') && !base.endsWith('\\n') ? ' ' : '';
+        escribir((base + separador + finalAcum + interino).trim());
+      }};
+      recog.onerror = function(e) {{ estado.textContent = 'Error: ' + e.error; }};
+      recog.onend = function() {{ if (escuchando && !detenidoManual) recog.start(); }};
     }})();
     </script>
     """
-    components.html(html_code, height=64)
+    components.html(html_code, height=height)
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# PLANTILLA DE ESTILO DEL RADIÓLOGO
-# ──────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# COPIAR AL PORTAPAPELES
+# ══════════════════════════════════════════════════════════════════════════
 
-def extraer_texto_plantilla(archivo) -> str:
-    """Extrae el texto de un informe subido como referencia de estilo (.docx o .txt)."""
-    nombre = archivo.name.lower()
-    if nombre.endswith(".docx"):
-        if not DOCX_DISPONIBLE:
-            raise RuntimeError("Instala `python-docx` para leer archivos .docx.")
-        documento = Document(archivo)
-        parrafos = [p.text for p in documento.paragraphs if p.text.strip()]
-        return "\n".join(parrafos)
-    return archivo.read().decode("utf-8", errors="ignore")
+def boton_copiar(texto: str, etiqueta: str, key: str):
+    texto_js = json.dumps(texto or "")
+    html = f"""
+    <button id="beam-copy-{key}" style="
+        width:100%; background:{PALETA['surface_alt']}; color:{PALETA['text']};
+        border:1px solid {PALETA['border']}; border-radius:8px;
+        font-size:0.8rem; font-weight:500; padding:7px 10px; cursor:pointer;
+        font-family:sans-serif;">{etiqueta}</button>
+    <script>
+    document.getElementById('beam-copy-{key}').addEventListener('click', function() {{
+        navigator.clipboard.writeText({texto_js});
+        const el = this;
+        const original = el.innerText;
+        el.innerText = '✓ Copiado';
+        setTimeout(() => {{ el.innerText = original; }}, 1400);
+    }});
+    </script>
+    """
+    components.html(html, height=42)
 
 
-def es_informe(texto: str) -> bool:
-    """Determina si un mensaje del asistente contiene un informe estructurado completo."""
-    t = texto.upper()
-    return "HALLAZGOS" in t and "CONCLUSIÓN" in t
+# ══════════════════════════════════════════════════════════════════════════
+# BARRA DE CAPTURA (dictado o texto libre)
+# ══════════════════════════════════════════════════════════════════════════
 
+def renderizar_barra_captura() -> bool:
+    st.markdown('<div class="beam-caja-captura">', unsafe_allow_html=True)
 
-def construir_system_prompt() -> str:
-    prompt = SYSTEM_PROMPT
-    plantilla = st.session_state.get("plantilla_texto", "")
-    if plantilla:
-        fragmento = plantilla[:6000]
-        prompt += (
-            "\n\nEl radiólogo ha compartido uno de sus informes previos como referencia de su "
-            "estilo personal de redacción (vocabulario habitual, orden interno de las secciones, "
-            "nivel de detalle, giros de frase). Adapta la redacción de TÉCNICA, HALLAZGOS y "
-            "CONCLUSIÓN a ese estilo siempre que sea coherente con las reglas terminológicas "
-            "anteriores, sin copiar datos clínicos de este ejemplo (corresponde a otro paciente, "
-            "es solo una referencia de forma):\n\n"
-            f"--- EJEMPLO DE ESTILO DEL RADIÓLOGO ---\n{fragmento}\n--- FIN DEL EJEMPLO ---"
+    col_txt, col_mic = st.columns([11, 1])
+    with col_txt:
+        st.session_state.dictado_actual = st.text_area(
+            ETIQUETA_CAPTURA,
+            value=st.session_state.dictado_actual,
+            height=88,
+            placeholder="Dicta o escribe los hallazgos del estudio…",
+            key="dictado_actual_widget",
         )
-    return prompt
+    with col_mic:
+        st.markdown("<div style='height:22px;'></div>", unsafe_allow_html=True)
+        widget_dictado_voz(PALETA["accent"], etiqueta_objetivo=ETIQUETA_CAPTURA, height=60)
 
-
-# ──────────────────────────────────────────────────────────────────────────
-# GENERACIÓN DE RESPUESTA (CHAT, CON STREAMING, DEEPSEEK)
-# ──────────────────────────────────────────────────────────────────────────
-
-def generar_respuesta(modelo: str):
-    cliente = obtener_cliente_deepseek()
-
-    historial_api = [{"role": "system", "content": construir_system_prompt()}] + [
-        {"role": m["role"], "content": m["content"]} for m in st.session_state.mensajes
-    ]
-
-    stream = cliente.chat.completions.create(
-        model=modelo,
-        messages=historial_api,
-        temperature=0.2,
-        stream=True,
-    )
-
-    def generador():
-        for fragmento in stream:
-            delta = fragmento.choices[0].delta
-            texto = getattr(delta, "content", None) or ""
-            if texto:
-                yield texto
-
-    return generador
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# INTERFAZ PRINCIPAL
-# ──────────────────────────────────────────────────────────────────────────
-
-def main():
-    _init_estado()
-
-    tema_seleccionado = TEMAS[st.session_state.tema_nombre].copy()
-    tema_seleccionado["accent"] = st.session_state.color_acento_custom
-    fuente_css = FUENTES[st.session_state.fuente_nombre]
-    inyectar_estilo(tema_seleccionado, fuente_css)
-
-    with st.sidebar:
-        st.markdown('<div class="titulo-beam">BEAM</div>', unsafe_allow_html=True)
+    col_btn, col_hint = st.columns([2, 6])
+    with col_btn:
+        generar = st.button(
+            "Generar informe", type="primary", use_container_width=True,
+            disabled=not st.session_state.dictado_actual.strip(),
+        )
+    with col_hint:
         st.markdown(
-            '<div class="subtitulo-beam">Chat de dictado e informes radiológicos</div>',
+            '<div style="height:38px;display:flex;align-items:center;">'
+            '<span style="font-size:.78rem;color:var(--muted);">'
+            "La IA infiere estructuras normales no dictadas — nunca inventa patología."
+            "</span></div>",
             unsafe_allow_html=True,
         )
 
-        with st.expander("🔑 Conexión (DeepSeek)", expanded=not st.session_state.deepseek_api_key):
+    st.markdown("</div>", unsafe_allow_html=True)
+    return generar
+
+
+def generar_y_mostrar(api_key: str, modelo: str):
+    contenedor = st.empty()
+    acumulado = ""
+    try:
+        for fragmento in generar_informe_stream(api_key, st.session_state.dictado_actual, modelo=modelo):
+            acumulado += fragmento
+            contenedor.markdown(
+                f'<div class="beam-tarjeta" style="white-space:pre-wrap;font-size:0.92rem;'
+                f'line-height:1.6;">{acumulado}▍</div>',
+                unsafe_allow_html=True,
+            )
+        st.session_state.informe = parsear_informe(acumulado)
+        contenedor.empty()
+        st.rerun()
+    except Exception as e:
+        contenedor.empty()
+        st.error(f"Error al generar el informe: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# SECCIONES EDITABLES + REFORMULACIÓN POR ESTILO
+# ══════════════════════════════════════════════════════════════════════════
+
+def _fila_reformulacion(clave: str, visible: str, api_key: str, modelo: str):
+    col_sel, col_btn, col_copy = st.columns([5, 2, 2])
+
+    with col_sel:
+        estilo_id = st.selectbox(
+            f"Estilo — {visible}",
+            options=ORDEN_ESTILOS,
+            format_func=lambda k: f"{ESTILOS_REDACCION[k]['nombre']} · {ESTILOS_REDACCION[k]['descripcion']}",
+            key=f"estilo_{clave}",
+            label_visibility="collapsed",
+        )
+    with col_btn:
+        aplicar = st.button("Reformular", key=f"reformular_{clave}", use_container_width=True)
+    with col_copy:
+        boton_copiar(st.session_state.informe.get(clave, ""), "Copiar sección", key=clave)
+
+    if aplicar:
+        if not api_key:
+            st.error("Configura tu API key de DeepSeek en la barra lateral.")
+            return
+        with st.spinner(f"Reescribiendo {visible.lower()} — estilo {ESTILOS_REDACCION[estilo_id]['nombre']}…"):
+            try:
+                nuevo_texto = reformular_seccion(
+                    api_key, NOMBRE_SECCION[clave], st.session_state.informe[clave], estilo_id, modelo=modelo,
+                )
+                st.session_state.informe[clave] = nuevo_texto
+                st.session_state.estilo_ultimo_aplicado[clave] = estilo_id
+                st.rerun()
+            except Exception as e:
+                st.error(f"No se pudo reformular: {e}")
+
+
+def renderizar_editor(api_key: str, modelo: str):
+    etiquetas = {"tecnica": "Técnica", "hallazgos": "Hallazgos", "conclusion": "Conclusión"}
+    alturas = {"tecnica": 90, "hallazgos": 220, "conclusion": 130}
+
+    for clave, visible in etiquetas.items():
+        st.markdown('<div class="beam-tarjeta">', unsafe_allow_html=True)
+        texto_actual = st.text_area(
+            visible,
+            value=st.session_state.informe.get(clave, ""),
+            height=alturas[clave],
+            key=f"texto_{clave}",
+        )
+        st.session_state.informe[clave] = texto_actual
+        _fila_reformulacion(clave, visible, api_key, modelo)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+def renderizar_barra_inferior(api_key: str, modelo: str):
+    st.markdown('<div class="beam-tarjeta">', unsafe_allow_html=True)
+    col1, col2, col3, col4 = st.columns([4, 2, 2, 2])
+
+    with col1:
+        estilo_global = st.selectbox(
+            "Estilo — informe completo",
+            options=ORDEN_ESTILOS,
+            format_func=lambda k: f"{ESTILOS_REDACCION[k]['nombre']} · {ESTILOS_REDACCION[k]['descripcion']}",
+            key="estilo_global",
+            label_visibility="collapsed",
+        )
+    with col2:
+        aplicar_global = st.button("Reformular todo", use_container_width=True)
+    with col3:
+        boton_copiar(reconstruir_informe(st.session_state.informe), "Copiar informe", key="informe_completo")
+    with col4:
+        nuevo_estudio = st.button("＋ Nuevo estudio", use_container_width=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if aplicar_global:
+        if not api_key:
+            st.error("Configura tu API key de DeepSeek en la barra lateral.")
+        else:
+            with st.spinner(f"Reescribiendo el informe completo — estilo {ESTILOS_REDACCION[estilo_global]['nombre']}…"):
+                try:
+                    st.session_state.informe = reformular_informe_completo(
+                        api_key, st.session_state.informe, estilo_global, modelo=modelo,
+                    )
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"No se pudo reformular el informe: {e}")
+
+    if nuevo_estudio:
+        limpiar_para_nuevo_estudio()
+        st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# APLICACIÓN PRINCIPAL
+# ══════════════════════════════════════════════════════════════════════════
+
+def main():
+    init_estado()
+    inyectar_estilo()
+
+    with st.sidebar:
+        st.markdown('<div class="beam-titulo-app">BEAM</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="beam-subtitulo-app">Workspace de informes radiológicos</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("<div style='height:14px;'></div>", unsafe_allow_html=True)
+
+        with st.expander("Configuración", expanded=not st.session_state.deepseek_api_key):
             st.session_state.deepseek_api_key = st.text_input(
-                "DeepSeek API key", value=st.session_state.deepseek_api_key,
-                type="password", placeholder="sk-...",
+                "DeepSeek API key",
+                value=st.session_state.deepseek_api_key,
+                type="password",
+                placeholder="sk-...",
             )
             modelo = st.selectbox(
                 "Modelo",
@@ -500,124 +726,30 @@ def main():
                 index=0,
             )
 
-        with st.expander("🎨 Apariencia"):
-            st.session_state.tema_nombre = st.selectbox(
-                "Paleta de color", list(TEMAS.keys()),
-                index=list(TEMAS.keys()).index(st.session_state.tema_nombre),
-            )
-            base_accent = TEMAS[st.session_state.tema_nombre]["accent"]
-            st.session_state.color_acento_custom = st.color_picker(
-                "Color de acento", value=st.session_state.color_acento_custom or base_accent,
-            )
-            st.session_state.fuente_nombre = st.selectbox(
-                "Tipografía", list(FUENTES.keys()),
-                index=list(FUENTES.keys()).index(st.session_state.fuente_nombre),
-            )
+    st.markdown(
+        '<div class="beam-header">'
+        '<span class="beam-titulo-app">Nuevo estudio<span class="beam-badge">BEAM 2.0</span></span>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
-        if st.button("＋ Nueva conversación", use_container_width=True):
-            st.session_state.mensajes = []
-            _init_estado()
-            st.rerun()
-
-        st.divider()
-
-        with st.expander("📄 Tu plantilla de estilo", expanded=not st.session_state.plantilla_texto):
-            st.caption(
-                "Sube un informe tuyo ya redactado (.docx o .txt) para que BEAM aprenda tu "
-                "vocabulario, orden interno y estilo de redacción, y lo use en todos los "
-                "informes que genere."
-            )
-            plantilla_archivo = st.file_uploader(
-                "Informe de referencia", type=["docx", "txt"], key="plantilla_uploader",
-            )
-            if plantilla_archivo is not None:
-                try:
-                    texto_plantilla = extraer_texto_plantilla(plantilla_archivo)
-                    if texto_plantilla.strip():
-                        st.session_state.plantilla_texto = texto_plantilla
-                        st.success(f"Plantilla cargada ({len(texto_plantilla)} caracteres).")
-                    else:
-                        st.warning("No se pudo extraer texto de ese archivo.")
-                except Exception as e:
-                    st.error(f"Error al leer la plantilla: {e}")
-
-            if st.session_state.plantilla_texto:
-                st.caption("✅ BEAM está usando tu plantilla como referencia de estilo.")
-                st.text_area(
-                    "Vista previa (solo lectura)",
-                    value=st.session_state.plantilla_texto[:2000],
-                    height=120, disabled=True,
-                )
-                if st.button("Quitar plantilla", use_container_width=True):
-                    st.session_state.plantilla_texto = ""
-                    st.rerun()
-
-    for mensaje in st.session_state.mensajes:
-        with st.chat_message(mensaje["role"]):
-            st.markdown(mensaje["content"])
-
-    # Si el último mensaje es un informe completo, ofrece reformular HALLAZGOS o CONCLUSIÓN
-    ultimo_msg = st.session_state.mensajes[-1] if st.session_state.mensajes else None
-    generar_ahora = False
-    if ultimo_msg and ultimo_msg["role"] == "assistant" and es_informe(ultimo_msg["content"]):
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("🔄 Otras opciones — HALLAZGOS", use_container_width=True):
-                st.session_state.mensajes.append({
-                    "role": "user",
-                    "content": (
-                        "Dame 2 o 3 alternativas de redacción para la sección HALLAZGOS del "
-                        "informe anterior. Mantén exactamente los mismos hallazgos clínicos "
-                        "(no agregues, quites ni cambies ningún hallazgo, positivo o normal), "
-                        "solo varía el estilo, el orden y la construcción de las frases. "
-                        "Numera cada opción con un encabezado claro (Opción 1, Opción 2, ...)."
-                    ),
-                })
-                st.session_state["_generar_ahora"] = True
-                st.rerun()
-        with col2:
-            if st.button("🔄 Otras opciones — CONCLUSIÓN", use_container_width=True):
-                st.session_state.mensajes.append({
-                    "role": "user",
-                    "content": (
-                        "Dame 2 o 3 alternativas de redacción para la sección CONCLUSIÓN del "
-                        "informe anterior. Mantén exactamente el mismo contenido clínico y las "
-                        "mismas categorías/grados de clasificación si aplica, solo varía el "
-                        "estilo, el orden y la construcción de las frases. Numera cada opción "
-                        "con un encabezado claro (Opción 1, Opción 2, ...)."
-                    ),
-                })
-                st.session_state["_generar_ahora"] = True
-                st.rerun()
-
-    # Ícono de dictado por voz, justo arriba del cuadro de chat
-    widget_dictado_voz(st.session_state.color_acento_custom)
-
-    prompt = st.chat_input("Dicta un estudio o pide un ajuste al informe…")
-
-    generar_ahora = generar_ahora or st.session_state.pop("_generar_ahora", False)
-
-    if prompt:
-        st.session_state.mensajes.append({"role": "user", "content": prompt})
-        generar_ahora = True
-        with st.chat_message("user"):
-            st.markdown(prompt)
-
-    if generar_ahora:
+    generar = renderizar_barra_captura()
+    if generar:
         if not st.session_state.deepseek_api_key:
-            st.error("Falta configurar tu DeepSeek API key en la barra lateral.")
+            st.error("Configura tu API key de DeepSeek en la barra lateral.")
         else:
-            with st.chat_message("assistant"):
-                try:
-                    generador = generar_respuesta(modelo)
-                    texto_completo = st.write_stream(generador())
-                    texto_final = aplicar_terminologia(texto_completo)
-                    if texto_final != texto_completo:
-                        st.markdown(texto_final)
-                except Exception as e:
-                    texto_final = f"Ocurrió un error al generar la respuesta: {e}"
-                    st.error(texto_final)
-            st.session_state.mensajes.append({"role": "assistant", "content": texto_final})
+            generar_y_mostrar(st.session_state.deepseek_api_key, modelo)
+
+    if not informe_esta_vacio():
+        renderizar_editor(st.session_state.deepseek_api_key, modelo)
+        renderizar_barra_inferior(st.session_state.deepseek_api_key, modelo)
+    else:
+        st.markdown(
+            '<p style="color:var(--muted);font-size:.85rem;">'
+            "El informe aparecerá aquí, en secciones editables, en cuanto lo generes."
+            "</p>",
+            unsafe_allow_html=True,
+        )
 
 
 if __name__ == "__main__":
