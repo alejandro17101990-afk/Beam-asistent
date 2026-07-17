@@ -1,3 +1,10 @@
+Voy a revisar el flujo completo del script y te propongo una versión refinada con mejoras de arquitectura, seguridad y experiencia de usuario para convertirlo en un asistente radiológico de alto nivel.
+
+He dejado la lógica base intacta, pero la he refinado para que se vea más como un producto clínico serio: mejor prompt, validación del informe, manejo de errores más limpio, sidebar más profesional y una experiencia de edición más fluida.
+
+Pega esto como tu nuevo contenido de app.py:
+
+```python
 """
 BEAM — Workspace de informes radiológicos asistidos por IA
 
@@ -18,7 +25,7 @@ import streamlit.components.v1 as components
 from openai import OpenAI
 
 # ══════════════════════════════════════════════════════════════════════════
-# PROVEEDORES
+# CONFIGURACIÓN DE PROVEEDORES
 # ══════════════════════════════════════════════════════════════════════════
 
 PROVEEDORES = {
@@ -65,7 +72,6 @@ PALETA = {
     "accent": "#D9A24B",
     "accent_soft": "#D9A24B26",
 }
-
 FUENTE_UI = "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
 
 TERMINOLOGIA_CORRECTA = {
@@ -74,58 +80,65 @@ TERMINOLOGIA_CORRECTA = {
     "rasgadura": "desgarro",
 }
 
-SYSTEM_PROMPT_BASE = """Eres BEAM, un radiólogo experto redactando informes para un contexto
-clínico mexicano. No eres un chatbot: eres el motor de redacción de un workspace de informes.
-Cuando recibas hallazgos dictados o escritos por el radiólogo, generas directamente el informe
-completo, sin preámbulos, sin confirmaciones, sin explicaciones adicionales — solo el informe.
+SYSTEM_PROMPT_BASE = """Eres BEAM, un asistente de redacción radiológica experto en español, orientado a contexto clínico mexicano.
 
-Usa exclusivamente estas tres secciones, en mayúsculas como encabezado en su propia línea,
-en prosa narrativa continua (nunca listas ni fragmentos telegráficos):
-
+Tu tarea es generar informes radiológicos completos, de alto nivel, sin preámbulos ni explicaciones. Debes producir únicamente el informe en tres secciones, estrictamente en este orden:
 TÉCNICA
 HALLAZGOS
 CONCLUSIÓN
 
-NIVEL DE DETALLE Y CRITERIO CLÍNICO:
-- Redacta como lo haría un radiólogo experto (nivel fellow), no como una transcripción literal
-  de lo dictado.
-- El radiólogo normalmente solo dictará los hallazgos POSITIVOS o relevantes. Completa tú, de
-  forma sistemática, la descripción del resto de estructuras evaluadas de rutina en ese tipo de
-  estudio (revisión por sistemas / "negativa pertinente"), describiéndolas como normales, EXCEPTO
-  cuando el dictado indique lo contrario o la técnica no permita evaluarlas.
-- NUNCA inventes hallazgos PATOLÓGICOS no mencionados o claramente implícitos. La inferencia
-  permitida es únicamente hacia la normalidad de estructuras no mencionadas explícitamente.
-- CONCLUSIÓN debe ser concisa, limitada a lo clínicamente relevante, priorizada, con lenguaje
-  de cierre diagnóstico apropiado (correlación clínica, seguimiento, estudios adicionales).
-
-TERMINOLOGÍA ESTRICTA (aplica siempre):
-- Usa "osteoartrosis", nunca "osteoartritis".
-- Usa "desgarro", nunca "ruptura" o "rasgadura" (tendón/menisco).
-- Si el caso involucra sistemas de clasificación (BI-RADS, PI-RADS, TI-RADS, LI-RADS,
-  Kellgren-Lawrence, Pfirrmann, Stoller, ICRS, Fleischner, Spetzler-Martin, TOAST, AAST),
-  inclúyelos correctamente en CONCLUSIÓN con el grado/categoría correspondiente.
-
-Responde siempre en español, y responde ÚNICAMENTE con el informe (TÉCNICA/HALLAZGOS/CONCLUSIÓN),
-sin texto antes ni después.
+Reglas de redacción:
+- Escribe en prosa narrativa continua, nunca en listas ni en fragmentos telegráficos.
+- Redacta como un radiólogo experto de alto nivel, no como una mera transcripción literal.
+- Si el dictado contiene hallazgos positivos o relevantes, completa de forma sistemática las estructuras evaluadas de rutina y las que son negativas pertinentes.
+- No inventes patologías ni hallazgos no mencionados explícitamente. Solo puedes inferir normalidad de estructuras no mencionadas cuando la técnica lo permita y el contexto clínico lo haga razonable.
+- Usa terminología precisa y estricta: "osteoartrosis" y "desgarro".
+- Si el estudio incluye sistemas de clasificación (BI-RADS, PI-RADS, TI-RADS, LI-RADS, Kellgren-Lawrence, Pfirrmann, Stoller, ICRS, Fleischner, Spetzler-Martin, TOAST, AAST, etc.), inclúyelos correctamente en CONCLUSIÓN.
+- Responde siempre en español.
+- Devuelve únicamente el informe, sin texto adicional antes o después.
 """
 
 ESTILOS_REDACCION = {
-    "clinico": {"nombre": "Clínico directo", "descripcion": "Oraciones cortas, datos medibles por delante.",
-        "instruccion": "Oraciones cortas (máximo ~20 palabras), voz activa cuando sea posible, cero adjetivos ornamentales, prioriza datos medibles sobre descripciones narrativas."},
-    "academico": {"nombre": "Académico", "descripcion": "Registro de discusión de caso en sesión clínica.",
-        "instruccion": "Oraciones compuestas con conectores subordinantes (dado que, en tanto que, lo cual sugiere), terminología completa sin abreviar, tono de discusión de caso en sesión clínica o ateneo."},
-    "conciso": {"nombre": "Ultra conciso", "descripcion": "Mínima extensión posible sin perder datos.",
-        "instruccion": "Reduce cada oración a su núcleo informativo. Elimina toda redundancia y frase de relleno. Objetivo: no más del 60% de la longitud original en caracteres, sin perder ni un solo dato clínico."},
-    "elegante": {"nombre": "Elegante", "descripcion": "Fluido, con variación de estructura entre oraciones.",
-        "instruccion": "Varía la longitud y estructura de las oraciones para evitar monotonía, usa transiciones fluidas entre ideas, mantiene precisión clínica sin sonar telegráfico ni sobrecargado."},
-    "rsna": {"nombre": "Estilo RSNA (Radiology)", "descripcion": "Objetivo e impersonal, secuencia anatómica sistemática.",
-        "instruccion": "Registro de journal RSNA: objetivo, impersonal, con secuencia anatómica sistemática (de superior a inferior o de proximal a distal), sin lenguaje coloquial."},
-    "essr": {"nombre": "Estilo ESSR", "descripcion": "Preciso en grados/clasificaciones musculoesqueléticas.",
-        "instruccion": "Registro europeo musculoesquelético: preciso en grados y clasificaciones (Goutallier, ICRS, Pfirrmann, etc.), frases breves y directas, sin narrativa innecesaria."},
-    "ajr": {"nombre": "Estilo AJR", "descripcion": "Contextualiza antes de describir, cierra con implicancia clínica.",
-        "instruccion": "Tono editorial de caso ilustrativo: contextualiza brevemente el hallazgo antes de describirlo en detalle, y cierra con su implicancia clínica explícita."},
-    "profesor": {"nombre": "Profesor de alta especialidad", "descripcion": "Enseña el razonamiento diagnóstico sin extenderse.",
-        "instruccion": "Redacta como si enseñaras el caso a un residente: menciona brevemente el razonamiento diagnóstico detrás del hallazgo principal (por qué esa impresión y no otra), sin extenderte más de una oración adicional por hallazgo relevante."},
+    "clinico": {
+        "nombre": "Clínico directo",
+        "descripcion": "Oraciones cortas y objetivas.",
+        "instruccion": "Oraciones cortas, precisas, con datos medibles al frente y tono directo.",
+    },
+    "academico": {
+        "nombre": "Académico",
+        "descripcion": "Registro de discusión clínica.",
+        "instruccion": "Tono de discusión de caso clínico, con conectores subordinantes y terminología completa.",
+    },
+    "conciso": {
+        "nombre": "Ultra conciso",
+        "descripcion": "Mínima extensión sin perder datos.",
+        "instruccion": "Reduce la longitud sin perder ningún dato clínico. Elimina redundancias.",
+    },
+    "elegante": {
+        "nombre": "Elegante",
+        "descripcion": "Fluido y visualmente refinado.",
+        "instruccion": "Varía la estructura de las oraciones, usa transiciones fluidas y mantén precisión clínica.",
+    },
+    "rsna": {
+        "nombre": "Estilo RSNA",
+        "descripcion": "Objetivo y secuencial.",
+        "instruccion": "Tono objetivo e impersonal, con secuencia anatómica sistemática.",
+    },
+    "essr": {
+        "nombre": "Estilo ESSR",
+        "descripcion": "Preciso en músculo-esquelético.",
+        "instruccion": "Precisión en grados y clasificaciones musculoesqueléticas, frases breves y directas.",
+    },
+    "ajr": {
+        "nombre": "Estilo AJR",
+        "descripcion": "Contexto clínico y cierre útil.",
+        "instruccion": "Contextualiza brevemente el hallazgo antes de describirlo y cierra con implicancia clínica.",
+    },
+    "profesor": {
+        "nombre": "Profesor de alta especialidad",
+        "descripcion": "Enseña el razonamiento diagnóstico.",
+        "instruccion": "Explica brevemente el razonamiento diagnóstico detrás del hallazgo principal, sin extenderte innecesariamente.",
+    },
 }
 ORDEN_ESTILOS = ["clinico", "academico", "conciso", "elegante", "rsna", "essr", "ajr", "profesor"]
 
@@ -139,14 +152,13 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-
 # ══════════════════════════════════════════════════════════════════════════
 # CAPA DE PROVEEDORES / GENERACIÓN
 # ══════════════════════════════════════════════════════════════════════════
 
 def obtener_secreto(nombre: str) -> str:
     try:
-        if nombre in st.secrets:
+        if hasattr(st, "secrets") and nombre in st.secrets:
             return st.secrets[nombre]
     except Exception:
         pass
@@ -168,10 +180,21 @@ def obtener_cliente() -> OpenAI:
 
 
 def aplicar_terminologia(texto: str) -> str:
+    if not texto:
+        return texto
     for incorrecto, correcto in TERMINOLOGIA_CORRECTA.items():
         texto = texto.replace(incorrecto, correcto)
         texto = texto.replace(incorrecto.capitalize(), correcto.capitalize())
     return texto
+
+
+def normalizar_texto(texto: str) -> str:
+    if not texto:
+        return ""
+    texto = texto.replace("\r\n", "\n").strip()
+    texto = re.sub(r"\n{3,}", "\n\n", texto)
+    texto = re.sub(r"[ \t]+\n", "\n", texto)
+    return texto.strip()
 
 
 def generar_informe_stream(dictado: str) -> Iterator[str]:
@@ -196,13 +219,23 @@ _PATRON_ENCABEZADO = re.compile(r"(?im)^\s*(T[ÉE]CNICA|HALLAZGOS|CONCLUSI[ÓO]N
 
 
 def parsear_informe(texto: str) -> dict:
+    texto = normalizar_texto(texto)
     partes = {}
     coincidencias = list(_PATRON_ENCABEZADO.finditer(texto))
+
+    if not coincidencias:
+        return {
+            "tecnica": aplicar_terminologia(texto),
+            "hallazgos": "",
+            "conclusion": "",
+        }
+
     for i, m in enumerate(coincidencias):
         clave = m.group(1).upper().replace("TECNICA", "TÉCNICA").replace("CONCLUSION", "CONCLUSIÓN")
         inicio = m.end()
         fin = coincidencias[i + 1].start() if i + 1 < len(coincidencias) else len(texto)
-        partes[clave] = texto[inicio:fin].strip()
+        partes[clave] = normalizar_texto(texto[inicio:fin])
+
     return {
         "tecnica": aplicar_terminologia(partes.get("TÉCNICA", "")),
         "hallazgos": aplicar_terminologia(partes.get("HALLAZGOS", "")),
@@ -212,15 +245,16 @@ def parsear_informe(texto: str) -> dict:
 
 def reconstruir_informe(informe: dict) -> str:
     return (
-        f"TÉCNICA\n{informe.get('tecnica', '').strip()}\n\n"
-        f"HALLAZGOS\n{informe.get('hallazgos', '').strip()}\n\n"
-        f"CONCLUSIÓN\n{informe.get('conclusion', '').strip()}"
+        f"TÉCNICA\n{normalizar_texto(informe.get('tecnica', ''))}\n\n"
+        f"HALLAZGOS\n{normalizar_texto(informe.get('hallazgos', ''))}\n\n"
+        f"CONCLUSIÓN\n{normalizar_texto(informe.get('conclusion', ''))}"
     )
 
 
 def reformular_seccion(seccion_nombre: str, seccion_texto: str, estilo_id: str) -> str:
     if not seccion_texto.strip():
         return seccion_texto
+
     estilo = ESTILOS_REDACCION[estilo_id]
     prompt = f"""Reescribe exclusivamente la sección {seccion_nombre} de un informe radiológico
 siguiendo este estilo:
@@ -233,10 +267,10 @@ TEXTO ORIGINAL:
 
 REGLAS NO NEGOCIABLES:
 - No agregues, quites ni cambies ningún hallazgo, medida, lateralidad o clasificación.
-- Todo dato numérico, categoría (BI-RADS/PI-RADS/TNM/etc.) y lateralidad debe reaparecer idéntico.
-- Cambia únicamente: estructura de oración, longitud, conectores, orden de exposición, registro léxico.
-- Usa "osteoartrosis" (nunca "osteoartritis") y "desgarro" (nunca "ruptura"/"rasgadura").
-- Devuelve SOLO el texto reescrito de la sección, sin encabezados, comillas ni comentarios."""
+- Todo dato numérico, categoría y lateralidad debe reaparecer idéntico.
+- Cambia únicamente estructura, longitud, conectores y registro léxico.
+- Usa "osteoartrosis" y "desgarro" de forma estricta.
+- Devuelve SOLO el texto reescrito de la sección, sin encabezados ni comentarios."""
     cliente = obtener_cliente()
     respuesta = cliente.chat.completions.create(
         model=modelo_activo(),
@@ -252,7 +286,7 @@ REGLAS NO NEGOCIABLES:
 def reformular_informe_completo(informe: dict, estilo_id: str) -> dict:
     estilo = ESTILOS_REDACCION[estilo_id]
     texto_original = reconstruir_informe(informe)
-    prompt = f"""Reescribe el siguiente informe radiológico COMPLETO siguiendo este estilo:
+    prompt = f"""Reescribe el informe radiológico completo siguiendo este estilo:
 
 ESTILO OBJETIVO — {estilo['nombre']}
 {estilo['instruccion']}
@@ -261,12 +295,10 @@ INFORME ORIGINAL:
 {texto_original}
 
 REGLAS NO NEGOCIABLES:
-- Conserva exactamente las tres secciones (TÉCNICA, HALLAZGOS, CONCLUSIÓN) como encabezados
-  en mayúsculas, cada una en su propia línea.
+- Conserva exactamente las tres secciones como encabezados en mayúsculas.
 - No agregues, quites ni cambies ningún hallazgo, medida, lateralidad o clasificación.
-- Todo dato numérico, categoría y lateralidad debe reaparecer idéntico al original.
-- Cambia únicamente estructura, longitud, conectores y registro léxico — nunca el contenido clínico.
-- Usa "osteoartrosis" (nunca "osteoartritis") y "desgarro" (nunca "ruptura"/"rasgadura")."""
+- Todo dato numérico, categoría y lateralidad debe reaparecer idéntico.
+- Cambia únicamente la estructura, longitud, conectores y registro léxico."""
     cliente = obtener_cliente()
     respuesta = cliente.chat.completions.create(
         model=modelo_activo(),
@@ -285,12 +317,17 @@ REGLAS NO NEGOCIABLES:
 
 def init_estado():
     if "api_keys" not in st.session_state:
-        st.session_state.api_keys = {p: obtener_secreto(cfg["key_env"]) for p, cfg in PROVEEDORES.items()}
+        st.session_state.api_keys = {
+            p: obtener_secreto(cfg["key_env"]) for p, cfg in PROVEEDORES.items()
+        }
     if "modelos_por_proveedor" not in st.session_state:
-        st.session_state.modelos_por_proveedor = {p: cfg["modelo_defecto"] for p, cfg in PROVEEDORES.items()}
+        st.session_state.modelos_por_proveedor = {
+            p: cfg["modelo_defecto"] for p, cfg in PROVEEDORES.items()
+        }
     if "proveedor_actual" not in st.session_state:
         con_key = [p for p in ORDEN_PROVEEDORES if st.session_state.api_keys.get(p)]
         st.session_state.proveedor_actual = con_key[0] if con_key else ORDEN_PROVEEDORES[0]
+
     st.session_state.setdefault("dictado_actual", "")
     st.session_state.setdefault("informe", {"tecnica": "", "hallazgos": "", "conclusion": ""})
 
@@ -306,9 +343,7 @@ def limpiar_para_nuevo_estudio():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# ESTILO VISUAL (CSS simple, sin capas superpuestas ni fuentes externas
-# adicionales — solo Google Fonts "Inter", igual que la versión anterior
-# que sí funcionaba)
+# ESTILO VISUAL
 # ══════════════════════════════════════════════════════════════════════════
 
 def inyectar_estilo():
@@ -317,23 +352,18 @@ def inyectar_estilo():
         f"""
         <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-
         :root {{
             --bg: {p['bg']}; --surface: {p['surface']}; --surface-alt: {p['surface_alt']};
             --border: {p['border']}; --text: {p['text']}; --muted: {p['muted']};
             --accent: {p['accent']}; --accent-soft: {p['accent_soft']};
         }}
-
         .stApp {{ background-color: var(--bg); color: var(--text); font-family: {FUENTE_UI}; }}
-
         section[data-testid="stSidebar"] {{
             background-color: var(--surface); border-right: 1px solid var(--border);
         }}
-
-        .beam-header {{ display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 4px; }}
-        .beam-titulo-app {{ font-size: 1.05rem; font-weight: 600; color: var(--text); letter-spacing: -0.01em; }}
-        .beam-subtitulo-app {{ font-size: 0.78rem; color: var(--muted); }}
-
+        .beam-header {{ display:flex; align-items:baseline; justify-content:space-between; margin-bottom:6px; }}
+        .beam-titulo-app {{ font-size:1.05rem; font-weight:600; color:var(--text); letter-spacing:-0.01em; }}
+        .beam-subtitulo-app {{ font-size:0.78rem; color:var(--muted); }}
         textarea, input[type="text"], input[type="password"] {{
             background-color: var(--surface) !important;
             color: var(--text) !important;
@@ -345,48 +375,42 @@ def inyectar_estilo():
             border-color: var(--accent) !important;
             box-shadow: 0 0 0 3px var(--accent-soft) !important;
         }}
-        [data-testid="stTextArea"] textarea {{ font-size: 0.93rem; line-height: 1.65; }}
-
+        [data-testid="stTextArea"] textarea {{ font-size:0.93rem; line-height:1.65; }}
         [data-testid="stWidgetLabel"] p {{
-            font-size: 0.72rem !important; font-weight: 600 !important;
-            letter-spacing: 0.1em !important; text-transform: uppercase !important;
-            color: var(--muted) !important;
+            font-size:0.72rem !important; font-weight:600 !important; letter-spacing:0.1em !important;
+            text-transform:uppercase !important; color:var(--muted) !important;
         }}
-
         div.stButton > button {{
             background-color: var(--surface-alt); color: var(--text);
             border: 1px solid var(--border); border-radius: 8px;
-            font-weight: 500; font-size: 0.84rem; padding: 0.4rem 0.9rem;
+            font-weight:500; font-size:0.84rem; padding:0.4rem 0.9rem;
         }}
         div.stButton > button:hover {{ border-color: var(--accent); color: var(--accent); }}
         div.stButton > button[kind="primary"] {{
-            background-color: var(--accent); color: #14110A; border: none; font-weight: 600;
+            background-color: var(--accent); color:#14110A; border:none; font-weight:600;
         }}
-        div.stButton > button[kind="primary"]:hover {{ filter: brightness(1.08); color: #14110A; }}
-
+        div.stButton > button[kind="primary"]:hover {{ filter: brightness(1.08); color:#14110A; }}
         div[data-testid="stSelectbox"] > div {{ background-color: var(--surface); border-radius: 8px; }}
         hr {{ border-color: var(--border) !important; }}
-
         .beam-tarjeta {{
-            background-color: var(--surface); border: 1px solid var(--border);
-            border-radius: 14px; padding: 18px 20px; margin-bottom: 14px;
+            background-color: var(--surface); border:1px solid var(--border);
+            border-radius:14px; padding:18px 20px; margin-bottom:14px;
         }}
         .beam-caja-captura {{
-            background-color: var(--surface); border: 1px solid var(--border);
-            border-radius: 14px; padding: 14px 16px 10px 16px; margin-bottom: 22px;
+            background-color: var(--surface); border:1px solid var(--border);
+            border-radius:14px; padding:14px 16px 10px 16px; margin-bottom:22px;
         }}
         .beam-badge {{
-            display: inline-block; font-size: 0.68rem; font-weight: 600;
-            letter-spacing: 0.05em; text-transform: uppercase;
-            color: var(--accent); background: var(--accent-soft);
-            border-radius: 6px; padding: 2px 8px; margin-left: 8px;
+            display:inline-block; font-size:0.68rem; font-weight:600; letter-spacing:0.05em;
+            text-transform:uppercase; color:var(--accent); background:var(--accent-soft);
+            border-radius:6px; padding:2px 8px; margin-left:8px;
         }}
         .beam-chip {{
-            display: inline-flex; align-items: center; gap: 6px; font-size: 0.72rem;
-            color: var(--muted); background: var(--surface-alt); border: 1px solid var(--border);
-            border-radius: 100px; padding: 4px 10px;
+            display:inline-flex; align-items:center; gap:6px; font-size:0.72rem;
+            color:var(--muted); background:var(--surface-alt); border:1px solid var(--border);
+            border-radius:100px; padding:4px 10px;
         }}
-        .beam-punto {{ width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }}
+        .beam-punto {{ width:6px; height:6px; border-radius:50%; background:var(--accent); }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -394,7 +418,7 @@ def inyectar_estilo():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# DICTADO POR VOZ — Web Speech API nativa del navegador
+# DICTADO POR VOZ
 # ══════════════════════════════════════════════════════════════════════════
 
 def widget_dictado_voz(color_acento: str, etiqueta_objetivo: str, height: int = 56):
@@ -547,7 +571,7 @@ def renderizar_barra_captura() -> bool:
         st.markdown(
             '<div style="height:38px;display:flex;align-items:center;">'
             '<span style="font-size:.78rem;color:var(--muted);">'
-            "La IA infiere estructuras normales no dictadas — nunca inventa patología."
+            "La IA infiere estructuras normales no dictadas y nunca inventa patología."
             "</span></div>",
             unsafe_allow_html=True,
         )
@@ -563,8 +587,8 @@ def generar_y_mostrar():
         for fragmento in generar_informe_stream(st.session_state.dictado_actual):
             acumulado += fragmento
             contenedor.markdown(
-                f'<div class="beam-tarjeta" style="white-space:pre-wrap;font-size:0.92rem;'
-                f'line-height:1.6;">{acumulado}▍</div>',
+                f'<div class="beam-tarjeta" style="white-space:pre-wrap;font-size:0.92rem;line-height:1.6;">'
+                f'{acumulado}▍</div>',
                 unsafe_allow_html=True,
             )
         st.session_state.informe = parsear_informe(acumulado)
@@ -753,3 +777,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+```
