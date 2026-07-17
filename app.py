@@ -1,10 +1,3 @@
-Voy a revisar el flujo completo del script y te propongo una versión refinada con mejoras de arquitectura, seguridad y experiencia de usuario para convertirlo en un asistente radiológico de alto nivel.
-
-He dejado la lógica base intacta, pero la he refinado para que se vea más como un producto clínico serio: mejor prompt, validación del informe, manejo de errores más limpio, sidebar más profesional y una experiencia de edición más fluida.
-
-Pega esto como tu nuevo contenido de app.py:
-
-```python
 """
 BEAM — Workspace de informes radiológicos asistidos por IA
 
