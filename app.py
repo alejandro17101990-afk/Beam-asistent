@@ -1,3 +1,4 @@
+
 """
 BEAM — Workspace de informes radiológicos asistidos por IA
 
